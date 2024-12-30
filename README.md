@@ -109,7 +109,7 @@ cargo run --bin ffmpeg-cluster-client -- \
 - [ ] Job handling and resume features
 - [ ] Enhanced client load balancing
 - [ ] Comprehensive web UI
-- [ ] Live streams comptaibility
+- [ ] Live streams compatibility
 - [ ] Jellyfin compatibility
 
 ## Contributing
