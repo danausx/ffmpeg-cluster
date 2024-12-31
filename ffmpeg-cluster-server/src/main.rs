@@ -4,7 +4,7 @@ use axum::{
     Router,
 };
 use clap::Parser;
-use ffmpeg_cluster_common::models::config::ServerConfig;
+use ffmpeg_cluster_common::models::{config::ServerConfig, messages::JobConfig};
 use services::ffmpeg::FfmpegService;
 use std::{collections::HashMap, path::Path, sync::Arc};
 use tokio::sync::{broadcast, Mutex};
@@ -16,7 +16,8 @@ mod handlers;
 mod services;
 mod utils;
 
-use handlers::{upload::upload_handler, websocket::ws_handler};
+use handlers::{command::command_ws_handler, upload::upload_handler, websocket::ws_handler};
+use services::job_queue::JobQueue;
 use services::segment_manager::SegmentManager;
 
 #[derive(Parser, Debug)]
@@ -52,8 +53,10 @@ pub struct AppState {
     pub clients: HashMap<String, f64>,
     pub client_segments: HashMap<String, String>,
     pub segment_manager: SegmentManager,
-    pub file_path: String,
+    pub job_queue: JobQueue,
     pub broadcast_tx: broadcast::Sender<ServerMessage>,
+    pub current_job: Option<String>,
+    pub file_path: Option<String>,
 }
 
 #[tokio::main]
@@ -122,8 +125,25 @@ async fn main() {
     info!("- Duration: {} seconds", duration);
     info!("- Total frames: {}", total_frames);
 
+    // Create initial job configuration
+    info!("Creating initial job from command line parameters...");
+    let initial_job_config = JobConfig {
+        ffmpeg_params: args
+            .ffmpeg_params
+            .split_whitespace()
+            .map(String::from)
+            .collect(),
+        required_clients: args.required_clients,
+        exactly: args.exactly,
+    };
+
     // Create broadcast channel
     let (tx, _) = broadcast::channel(100);
+
+    // Initialize state with job queue containing the initial job
+    let mut job_queue = JobQueue::new();
+    let initial_job_id = job_queue.add_job(input_path.clone(), initial_job_config);
+    info!("Created initial job with ID: {}", initial_job_id);
 
     // Initialize state
     let state = Arc::new(Mutex::new(AppState {
@@ -145,8 +165,10 @@ async fn main() {
         clients: HashMap::new(),
         client_segments: HashMap::new(),
         segment_manager: SegmentManager::new(),
-        file_path: input_path.to_str().unwrap().to_string(),
+        job_queue,
         broadcast_tx: tx,
+        current_job: None,
+        file_path: Some(input_path.to_str().unwrap().to_string()),
     }));
 
     // Initialize segment manager
@@ -161,10 +183,11 @@ async fn main() {
     // Setup server with large body limit
     let app = Router::new()
         .route("/ws", get(ws_handler))
+        .route("/ws/command", get(command_ws_handler))
         .route("/upload", post(upload_handler))
         .nest_service("/files", ServeDir::new("."))
         .layer(CorsLayer::permissive())
-        .layer(DefaultBodyLimit::max(1024 * 1024 * 1024 * 2)) // 2GB limit
+        .layer(DefaultBodyLimit::max(1024 * 1024 * 1024 * 4)) // 4GB limit
         .with_state(state.clone());
 
     let addr = format!("0.0.0.0:{}", args.port);

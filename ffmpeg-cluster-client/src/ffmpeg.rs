@@ -227,30 +227,20 @@ impl FfmpegProcessor {
 
         tokio::fs::create_dir_all(&job_dir).await?;
 
-        let fps = 23.976023976023978; // Match the exact input FPS
-        let start_time_sec = start_frame as f64 / fps;
-        let duration_sec = (end_frame - start_frame) as f64 / fps;
-
-        // Convert time values to strings before using them
-        let start_time_str = start_time_sec.to_string();
-        let duration_str = duration_sec.to_string();
-
         let segment_filename = format!("segment_{}.mp4", start_frame);
         let output_file = job_dir.join(&segment_filename);
         let temp_file = job_dir.join(format!("temp_{}.mp4", start_frame));
+        let filter_str = format!("select=between(n\\,{}\\,{})", start_frame, end_frame - 1);
 
-        // First pass: Extract exact frames using decode/encode
-        let mut args = vec!["-y", "-i", input_file];
-
-        // Different handling for first segment vs others
-        if start_frame == 0 {
-            args.extend(["-t", &duration_str]);
-        } else {
-            args.extend(["-ss", &start_time_str, "-t", &duration_str]);
-        }
-
-        // Add encoding parameters
-        args.extend([
+        // Use exact frame selection
+        let mut args = vec![
+            "-y",
+            "-i",
+            input_file,
+            "-vf",
+            &filter_str,
+            "-vsync",
+            "1",
             "-map",
             "0:v:0",
             "-c:v",
@@ -261,8 +251,6 @@ impl FfmpegProcessor {
             "avc1",
             "-profile:v",
             "high",
-            "-vsync",
-            "1", // Changed from 0 to 1 for frame accuracy
             "-an",
             "-movflags",
             "+faststart",
@@ -270,7 +258,7 @@ impl FfmpegProcessor {
             "30000",
             "-frame_pts",
             "1",
-        ]);
+        ];
 
         args.push(temp_file.to_str().unwrap());
 

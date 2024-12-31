@@ -1,8 +1,10 @@
+// ffmpeg-cluster-client/src/main.rs
+
 use clap::Parser;
 use ffmpeg_cluster_common::models::messages::{ClientMessage, ServerMessage};
 use futures_util::{SinkExt, StreamExt};
 use std::{path::Path, time::Duration};
-use tokio::{fs::File, io::AsyncReadExt};
+use tokio::{fs::File, io::AsyncReadExt, time::sleep};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use tracing::{error, info};
 
@@ -20,6 +22,258 @@ struct Args {
 
     #[arg(long, default_value = "10")]
     benchmark_duration: u32,
+
+    #[arg(long, default_value = "5")] // 5 second reconnection delay
+    reconnect_delay: u64,
+
+    #[arg(long, default_value = "true")]
+    persistent: bool,
+}
+
+// Removed Clone derive
+struct ClientState {
+    client_id: Option<String>,
+    job_id: Option<String>,
+    processor: Option<FfmpegProcessor>,
+    benchmark_completed: bool,
+}
+
+impl ClientState {
+    fn new() -> Self {
+        Self {
+            client_id: None,
+            job_id: None,
+            processor: None,
+            benchmark_completed: false,
+        }
+    }
+
+    fn reset_job_state(&mut self) {
+        self.job_id = None;
+        self.benchmark_completed = false;
+        // Keep processor and client_id
+    }
+}
+
+async fn connect_to_server(
+    args: &Args,
+) -> Result<
+    (
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+        String,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    let ws_url = format!("ws://{}:{}/ws", args.server_ip, args.server_port);
+    let (ws_stream, _) = connect_async(&ws_url).await?;
+    info!("Connected to server at {}", ws_url);
+    Ok((ws_stream, ws_url))
+}
+
+async fn handle_connection(
+    state: &mut ClientState,
+    ws_stream: tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    args: &Args,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (mut write, mut read) = StreamExt::split(ws_stream);
+
+    // Request ID if we don't have one
+    if state.client_id.is_none() {
+        let msg = serde_json::to_string(&ClientMessage::RequestId)?;
+        write.send(Message::Text(msg.into())).await?;
+    }
+
+    while let Some(msg) = read.next().await {
+        match msg {
+            Ok(Message::Text(text)) => {
+                let server_msg: ServerMessage = serde_json::from_str(&text)?;
+                match server_msg {
+                    ServerMessage::ClientId { id, job_id } => {
+                        if state.client_id.is_none() {
+                            info!("Received client ID: {} for job: {}", id, job_id);
+                            state.client_id = Some(id.clone());
+
+                            // Initialize processor if not already done
+                            if state.processor.is_none() {
+                                let proc = FfmpegProcessor::new(&id).await;
+                                proc.init().await?;
+                                state.processor = Some(proc);
+                            }
+                        }
+
+                        // Always update job ID and processor state
+                        state.job_id = Some(job_id.clone());
+                        if let Some(proc) = &mut state.processor {
+                            proc.set_job_id(&job_id);
+                            proc.init_job(&job_id).await?;
+                        }
+                    }
+                    ServerMessage::ClientIdle { id } => {
+                        info!("Received idle state with client ID: {}", id);
+                        if state.client_id.is_none() {
+                            state.client_id = Some(id.clone());
+
+                            // Initialize processor but don't start any job
+                            if state.processor.is_none() {
+                                let proc = FfmpegProcessor::new(&id).await;
+                                proc.init().await?;
+                                state.processor = Some(proc);
+                            }
+                        }
+                        // Clear any existing job state
+                        state.job_id = None;
+                        state.benchmark_completed = false;
+                    }
+                    ServerMessage::StartBenchmark {
+                        file_url,
+                        params: _,
+                        job_id,
+                    } => {
+                        if state.benchmark_completed {
+                            info!("Ignoring duplicate benchmark request");
+                            continue;
+                        }
+
+                        // Only process benchmark if we have a job
+                        if state.job_id.is_some() {
+                            info!("Starting benchmark with file: {}", file_url);
+                            if let Some(proc) = &mut state.processor {
+                                proc.set_job_id(&job_id);
+                                match proc.run_benchmark(&file_url, args.benchmark_duration).await {
+                                    Ok(fps) => {
+                                        info!("Benchmark complete: {} FPS", fps);
+                                        state.benchmark_completed = true;
+                                        let response = ClientMessage::BenchmarkResult { fps };
+                                        let msg = serde_json::to_string(&response)?;
+                                        write.send(Message::Text(msg.into())).await?;
+                                    }
+                                    Err(e) => {
+                                        error!("Benchmark failed: {}", e);
+                                    }
+                                }
+                            }
+                        } else {
+                            info!("Ignoring benchmark request as client is idle");
+                        }
+                    }
+                    ServerMessage::AdjustSegment {
+                        file_url,
+                        params: _,
+                        start_frame,
+                        end_frame,
+                        job_id,
+                    } => {
+                        // Only process segments if we have a job
+                        if state.job_id.is_some() {
+                            info!("Processing segment: frames {}-{}", start_frame, end_frame);
+
+                            if let Some(proc) = &mut state.processor {
+                                proc.set_job_id(&job_id);
+                                match proc
+                                    .process_segment(&file_url, start_frame, end_frame)
+                                    .await
+                                {
+                                    Ok((output_path, fps)) => {
+                                        match upload_segment(&output_path, args).await {
+                                            Ok(segment_id) => {
+                                                let response = ClientMessage::SegmentComplete {
+                                                    segment_id,
+                                                    fps,
+                                                };
+                                                let msg = serde_json::to_string(&response)?;
+                                                write.send(Message::Text(msg.into())).await?;
+                                            }
+                                            Err(e) => {
+                                                error!("Upload failed: {}", e);
+                                                let response = ClientMessage::SegmentFailed {
+                                                    error: e.to_string(),
+                                                };
+                                                let msg = serde_json::to_string(&response)?;
+                                                write.send(Message::Text(msg.into())).await?;
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        error!("Segment processing failed: {}", e);
+                                        let response = ClientMessage::SegmentFailed {
+                                            error: e.to_string(),
+                                        };
+                                        let msg = serde_json::to_string(&response)?;
+                                        write.send(Message::Text(msg.into())).await?;
+                                    }
+                                }
+                            }
+                        } else {
+                            info!("Ignoring segment processing request as client is idle");
+                        }
+                    }
+                }
+            }
+            Ok(Message::Close(_)) => {
+                info!("Server requested close");
+                break;
+            }
+            Ok(Message::Ping(_)) => {
+                write.send(Message::Pong(Vec::new().into())).await?;
+            }
+            Err(e) => {
+                error!("WebSocket error: {}", e);
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    tracing_subscriber::fmt::init();
+    let args = Args::parse();
+
+    info!("FFmpeg Cluster Client starting...");
+    info!("Connecting to {}:{}", args.server_ip, args.server_port);
+
+    let mut state = ClientState::new();
+
+    loop {
+        match connect_to_server(&args).await {
+            Ok((ws_stream, url)) => {
+                info!("Connected to {}", url);
+
+                match handle_connection(&mut state, ws_stream, &args).await {
+                    Ok(()) => {
+                        if !args.persistent {
+                            info!("Non-persistent mode, exiting");
+                            break;
+                        }
+                        state.reset_job_state(); // Reset job-specific state but keep client ID
+                        info!("Connection closed, will retry...");
+                    }
+                    Err(e) => {
+                        error!("Connection error: {}", e);
+                    }
+                }
+            }
+            Err(e) => {
+                error!("Failed to connect: {}", e);
+            }
+        }
+
+        if args.persistent {
+            info!("Reconnecting in {} seconds...", args.reconnect_delay);
+            sleep(Duration::from_secs(args.reconnect_delay)).await;
+        } else {
+            break;
+        }
+    }
+
+    Ok(())
 }
 
 async fn upload_segment(
@@ -74,121 +328,4 @@ async fn upload_segment(
     } else {
         Err(format!("Upload failed: {} - {}", status, response_text).into())
     }
-}
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt::init();
-    let args = Args::parse();
-
-    info!("FFmpeg Cluster Client starting...");
-    info!("Connecting to {}:{}", args.server_ip, args.server_port);
-
-    let ws_url = format!("ws://{}:{}/ws", args.server_ip, args.server_port);
-    let (ws_stream, _) = connect_async(&ws_url).await?;
-    info!("Connected to server");
-
-    let (mut write, mut read) = StreamExt::split(ws_stream);
-    let mut benchmark_completed = false;
-    let mut processor: Option<FfmpegProcessor> = None;
-
-    let msg = ClientMessage::RequestId;
-    write
-        .send(Message::Text(serde_json::to_string(&msg)?.into()))
-        .await?;
-
-    while let Some(msg) = read.next().await {
-        match msg {
-            Ok(Message::Text(text)) => {
-                let server_msg: ServerMessage = serde_json::from_str(&text)?;
-                match server_msg {
-                    ServerMessage::ClientId { id, job_id } => {
-                        info!("Received client ID: {} for job: {}", id, job_id);
-                        // Initialize processor with hardware acceleration
-                        let mut proc = FfmpegProcessor::new(&id).await;
-                        proc.init().await?;
-                        proc.set_job_id(&job_id);
-                        proc.init_job(&job_id).await?;
-                        processor = Some(proc);
-                    }
-                    ServerMessage::StartBenchmark {
-                        file_url,
-                        params: _, // We ignore the params as we'll use HW encoding
-                        job_id,
-                    } => {
-                        if benchmark_completed {
-                            info!("Ignoring duplicate benchmark request");
-                            continue;
-                        }
-
-                        info!("Starting benchmark with file: {}", file_url);
-                        if let Some(proc) = &mut processor {
-                            proc.set_job_id(&job_id);
-                            let fps = proc
-                                .run_benchmark(&file_url, args.benchmark_duration)
-                                .await?;
-                            info!("Benchmark complete: {} FPS", fps);
-
-                            benchmark_completed = true;
-                            let response = ClientMessage::BenchmarkResult { fps };
-                            write
-                                .send(Message::Text(serde_json::to_string(&response)?.into()))
-                                .await?;
-                        }
-                    }
-                    ServerMessage::AdjustSegment {
-                        file_url,
-                        params: _, // We ignore the params as we'll use HW encoding
-                        start_frame,
-                        end_frame,
-                        job_id,
-                    } => {
-                        info!("Processing segment: frames {}-{}", start_frame, end_frame);
-
-                        if let Some(proc) = &mut processor {
-                            proc.set_job_id(&job_id);
-                            match proc
-                                .process_segment(&file_url, start_frame, end_frame)
-                                .await
-                            {
-                                Ok((output_path, fps)) => {
-                                    match upload_segment(&output_path, &args).await {
-                                        Ok(segment_id) => {
-                                            let response =
-                                                ClientMessage::SegmentComplete { segment_id, fps };
-                                            write
-                                                .send(Message::Text(
-                                                    serde_json::to_string(&response)?.into(),
-                                                ))
-                                                .await?;
-                                        }
-                                        Err(e) => {
-                                            error!("Upload failed: {}", e);
-                                            break;
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    error!("Segment processing failed: {}", e);
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            Ok(Message::Close(_)) => {
-                info!("Server closed connection");
-                break;
-            }
-            Err(e) => {
-                error!("WebSocket error: {}", e);
-                break;
-            }
-            _ => {}
-        }
-    }
-
-    info!("Connection closed");
-    Ok(())
 }
