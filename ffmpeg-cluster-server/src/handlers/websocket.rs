@@ -1,18 +1,16 @@
-use crate::{services::ffmpeg::FfmpegService, AppState, ServerMessage};
+use crate::AppState;
 use axum::{
     extract::{
-        ws::{WebSocket, WebSocketUpgrade},
+        ws::{Message, WebSocket, WebSocketUpgrade},
         State,
     },
     response::Response,
 };
-use ffmpeg_cluster_common::models::messages::{
-    ClientMessage, ServerMessage as ClientServerMessage,
-};
+use ffmpeg_cluster_common::models::messages::{ClientMessage, ServerMessage};
 use futures::{SinkExt, StreamExt};
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tracing::{info, warn};
+use tracing::{error, info};
 use uuid::Uuid;
 
 pub async fn ws_handler(
@@ -26,67 +24,82 @@ async fn handle_socket(socket: WebSocket, state_arc: Arc<Mutex<AppState>>) {
     let client_id = Uuid::new_v4().to_string();
     let (mut sender, mut receiver) = socket.split();
 
-    // Get the job ID from the segment manager
-    let job_id = {
+    // Get initial state info
+    let (job_id, required_clients) = {
         let state = state_arc.lock().await;
-        state.segment_manager.get_job_id().to_string()
+        (
+            state.segment_manager.get_job_id().to_string(),
+            state.config.required_clients,
+        )
     };
 
-    // First, send client ID along with the job ID
-    if let Ok(msg_str) = serde_json::to_string(&ClientServerMessage::ClientId {
+    // Send initial client ID
+    if let Ok(msg_str) = serde_json::to_string(&ServerMessage::ClientId {
         id: client_id.clone(),
         job_id: job_id.clone(),
     }) {
-        let _ = sender
-            .send(axum::extract::ws::Message::Text(msg_str.into()))
-            .await;
+        if let Err(e) = sender.send(Message::Text(msg_str)).await {
+            error!("Failed to send initial client ID: {}", e);
+            return;
+        }
     }
     info!("New client connected: {} for job {}", client_id, job_id);
 
-    // Add client to state and check if we should start benchmark
+    // Register client and check if all are connected
     let should_start_benchmark = {
         let mut state = state_arc.lock().await;
         state.clients.insert(client_id.clone(), 0.0);
         info!(
-            "Client count: {}/{} clients",
+            "Current clients: {}/{}",
             state.clients.len(),
-            state.config.required_clients
+            required_clients
         );
-        state.clients.len() == state.config.required_clients
+        state.clients.len() == required_clients
     };
 
-    // Get own broadcast receiver
+    // Subscribe to broadcast channel
     let mut broadcast_rx = {
         let state = state_arc.lock().await;
         state.broadcast_tx.subscribe()
     };
 
-    // If we just reached the required number of clients, broadcast benchmark request
+    // If this is the last client to connect, send benchmark request to all
     if should_start_benchmark {
         info!("Required client count reached. Starting benchmark phase...");
-        let state = state_arc.lock().await;
-        let benchmark_msg = ClientServerMessage::StartBenchmark {
-            file_url: state.file_path.clone(),
-            params: state
-                .config
-                .ffmpeg_params
-                .split_whitespace()
-                .map(String::from)
-                .collect(),
-            job_id: job_id.clone(),
+        let benchmark_msg = {
+            let state = state_arc.lock().await;
+            ServerMessage::StartBenchmark {
+                file_url: state.file_path.clone(),
+                params: state
+                    .config
+                    .ffmpeg_params
+                    .split_whitespace()
+                    .map(String::from)
+                    .collect(),
+                job_id: job_id.clone(),
+            }
         };
 
         if let Ok(msg_str) = serde_json::to_string(&benchmark_msg) {
-            let broadcast_msg = ServerMessage {
+            let state = state_arc.lock().await;
+            if let Err(e) = state.broadcast_tx.send(crate::ServerMessage {
                 target: None,
                 content: msg_str,
-            };
-            if let Err(e) = state.broadcast_tx.send(broadcast_msg) {
-                warn!("Failed to broadcast benchmark request: {}", e);
-            } else {
-                info!("Benchmark request broadcasted to all clients");
+            }) {
+                error!("Failed to broadcast benchmark start: {}", e);
+                return;
             }
+            info!("Benchmark request broadcasted to all clients");
         }
+    } else {
+        info!(
+            "Awaiting more clients... ({}/{})",
+            {
+                let state = state_arc.lock().await;
+                state.clients.len()
+            },
+            required_clients
+        );
     }
 
     // Main message loop
@@ -94,162 +107,191 @@ async fn handle_socket(socket: WebSocket, state_arc: Arc<Mutex<AppState>>) {
         tokio::select! {
             msg = receiver.next() => {
                 match msg {
-                    Some(Ok(msg)) => {
-                        if let axum::extract::ws::Message::Text(text) = msg {
-                            if let Ok(client_msg) = serde_json::from_str::<ClientMessage>(&text) {
-                                match client_msg {
-                                    ClientMessage::RequestId => {
-                                        // Send both client ID and job ID
-                                        if let Ok(msg_str) = serde_json::to_string(&ClientServerMessage::ClientId {
-                                            id: client_id.clone(),
-                                            job_id: job_id.clone(),
-                                        }) {
-                                            if let Err(e) = sender.send(axum::extract::ws::Message::Text(msg_str.into())).await {
-                                                warn!("Failed to send client ID: {}", e);
-                                                break;
-                                            }
-                                        }
+                    Some(Ok(Message::Text(text))) => {
+                        if let Ok(client_msg) = serde_json::from_str::<ClientMessage>(&text) {
+                            match client_msg {
+                                ClientMessage::BenchmarkResult { fps } => {
+                                    info!("Benchmark result from client {}: {} FPS", client_id, fps);
+                                    let mut state = state_arc.lock().await;
+                                    state.clients.insert(client_id.clone(), fps);
+
+                                    // Only proceed if all clients have reported benchmarks
+                                    if !state.clients.values().all(|&f| f > 0.0) {
+                                        continue;
                                     }
-                                    ClientMessage::BenchmarkResult { fps } => {
-                                        info!("Benchmark result from client {}: {} FPS", client_id, fps);
 
-                                        // Store benchmark result and check if all clients reported
-                                        {
-                                            let mut state = state_arc.lock().await;
-                                            state.clients.insert(client_id.clone(), fps);
+                                    let total_fps: f64 = state.clients.values().sum();
+                                    let file_path = state.file_path.clone();
+                                    let ffmpeg_params = state.config.ffmpeg_params.clone();
 
-                                            if state.clients.len() == state.config.required_clients
-                                                && state.clients.values().all(|&f| f > 0.0)
-                                            {
-                                                let total_fps: f64 = state.clients.values().sum();
-                                                let mut current_frame = 0u64;
+                                    // Get video info
+                                    match crate::services::ffmpeg::FfmpegService::get_video_info(
+                                        &file_path,
+                                        state.config.exactly,
+                                    )
+                                    .await
+                                    {
+                                        Ok((fps, duration, total_frames)) => {
+                                            info!("Video info: FPS={}, Duration={}, Total Frames={}", fps, duration, total_frames);
+                                            let mut current_frame = 0u64;
+                                            let mut remaining_frames = total_frames;
 
-                                                // Prepare for segment assignment
-                                                let file_path = state.file_path.clone();
-                                                let exactly = state.config.exactly;
-                                                let ffmpeg_params = state.config.ffmpeg_params.clone();
+                                            // Sort clients for consistent ordering
+                                            let mut sorted_clients: Vec<(String, f64)> = state
+                                                .clients
+                                                .iter()
+                                                .map(|(k, &v)| (k.clone(), v))
+                                                .collect();
+                                            sorted_clients.sort_by_key(|(k, _)| k.clone());
 
-                                                // Sort clients for consistent ordering
-                                                let mut sorted_clients: Vec<(String, f64)> = state
-                                                    .clients
-                                                    .iter()
-                                                    .map(|(k, &v)| (k.clone(), v))
-                                                    .collect();
-                                                sorted_clients.sort_by_key(|(k, _)| k.clone());
+                                            let total_clients = sorted_clients.len();
+                                            let mut clients_processed = 0;
 
-                                                drop(state);
+                                            // Calculate minimum segment size based on FPS
+                                            let min_frames = (fps * 1.0) as u64; // Minimum 1 second worth of frames
 
-                                                if let Ok((_, _, total_frames)) = FfmpegService::get_video_info(&file_path, exactly).await {
-                                                    let mut state = state_arc.lock().await;
+                                            // Assign segments with more precise frame distribution
+                                            for (client_id, client_fps) in sorted_clients {
+                                                clients_processed += 1;
+                                                let is_last_client = clients_processed == total_clients;
 
-                                                    // Calculate and send assignments
-                                                    for (i, (id, client_fps)) in sorted_clients.iter().enumerate() {
-                                                        let client_share = client_fps / total_fps;
-                                                        let frames_for_client = (total_frames as f64 * client_share) as u64;
-                                                        let start_frame = current_frame;
-                                                        let end_frame = if i == sorted_clients.len() - 1 {
-                                                            total_frames
-                                                        } else {
-                                                            start_frame + frames_for_client
-                                                        };
+                                                let client_share = client_fps / total_fps;
+                                                let mut frames_for_client = if is_last_client {
+                                                    // Last client gets all remaining frames
+                                                    remaining_frames
+                                                } else {
+                                                    // Calculate frames ensuring we don't exceed remaining frames
+                                                    let calculated_frames = (total_frames as f64 * client_share).round() as u64;
+                                                    calculated_frames.min(remaining_frames)
+                                                };
 
-                                                        let segment_id = format!("segment_{}", start_frame);
-                                                        state.client_segments.insert(id.clone(), segment_id.clone());
+                                                // Ensure minimum segment size
+                                                if frames_for_client < min_frames && remaining_frames >= min_frames {
+                                                    frames_for_client = min_frames;
+                                                }
 
-                                                        info!("Assigned segment to client {}", id);
-                                                        info!("- Frames: {} to {} ({:.1}% of video)",
-                                                            start_frame, end_frame,
-                                                            (end_frame - start_frame) as f64 / total_frames as f64 * 100.0
-                                                        );
+                                                let start_frame = current_frame;
+                                                let end_frame = start_frame + frames_for_client;
 
-                                                        let segment_msg = ClientServerMessage::AdjustSegment {
-                                                            file_url: file_path.clone(),
-                                                            params: ffmpeg_params.split_whitespace().map(String::from).collect(),
-                                                            start_frame,
-                                                            end_frame,
-                                                            job_id: job_id.clone(),
-                                                        };
+                                                info!(
+                                                    "Assigning segment to client {} - frames {} to {} ({:.1}% of video)",
+                                                    client_id,
+                                                    start_frame,
+                                                    end_frame,
+                                                    frames_for_client as f64 / total_frames as f64 * 100.0
+                                                );
 
-                                                        if let Ok(msg_str) = serde_json::to_string(&segment_msg) {
-                                                            let broadcast_msg = ServerMessage {
-                                                                target: Some(id.clone()),
-                                                                content: msg_str,
-                                                            };
-                                                            if let Err(e) = state.broadcast_tx.send(broadcast_msg) {
-                                                                warn!("Failed to send segment assignment to client {}: {}", id, e);
-                                                            } else {
-                                                                info!("Successfully sent segment assignment to client {}", id);
-                                                            }
-                                                        }
+                                                let segment_id = format!("segment_{}.mp4", start_frame);
+                                                state.client_segments.insert(client_id.clone(), segment_id);
 
-                                                        current_frame = end_frame;
+                                                let msg = ServerMessage::AdjustSegment {
+                                                    file_url: file_path.clone(),
+                                                    params: ffmpeg_params.split_whitespace().map(String::from).collect(),
+                                                    start_frame,
+                                                    end_frame,
+                                                    job_id: job_id.clone(),
+                                                };
+
+                                                if let Ok(msg_str) = serde_json::to_string(&msg) {
+                                                    if let Err(e) = state.broadcast_tx.send(crate::ServerMessage {
+                                                        target: Some(client_id.clone()),
+                                                        content: msg_str,
+                                                    }) {
+                                                        error!("Failed to send segment assignment: {}", e);
+                                                    } else {
+                                                        info!("Sent segment assignment to client {}", client_id);
                                                     }
                                                 }
-                                            }
-                                        }
-                                    }
-                                    ClientMessage::SegmentComplete { segment_id, fps } => {
-                                        info!("Client {} completed segment {} at {} FPS", client_id, segment_id, fps);
 
-                                        let mut state = state_arc.lock().await;
-                                        state.segment_manager.add_segment(client_id.clone(), segment_id.clone());
+                                                current_frame = end_frame;
+                                                remaining_frames -= frames_for_client;
 
-                                        let required_clients = state.config.required_clients;
-                                        let segments_complete = state.segment_manager.get_segment_count() == required_clients;
-
-                                        info!("Progress: {}/{} segments complete",
-                                            state.segment_manager.get_segment_count(),
-                                            required_clients
-                                        );
-
-                                        if segments_complete {
-                                            info!("All segments received, starting combination...");
-                                            let output_file = state.config.file_name_output.clone();
-                                            let input_file = state.file_path.clone();
-
-                                            match state.segment_manager
-                                                .combine_segments(&output_file, &input_file)
-                                                .await
-                                            {
-                                                Ok(_) => {
-                                                    info!("Successfully combined segments into: {}", output_file);
-                                                }
-                                                Err(e) => {
-                                                    warn!("Failed to combine segments: {}", e);
+                                                // Double check we haven't lost any frames
+                                                if is_last_client && end_frame != total_frames {
+                                                    error!(
+                                                        "Frame count mismatch! End frame {} != Total frames {}",
+                                                        end_frame, total_frames
+                                                    );
                                                 }
                                             }
                                         }
-                                    }
-                                    ClientMessage::Finish { fps } => {
-                                        info!("Client {} finished with final FPS: {}", client_id, fps);
+                                        Err(e) => {
+                                            error!("Failed to get video info: {}", e);
+                                        }
                                     }
                                 }
+                                ClientMessage::SegmentComplete { segment_id, fps } => {
+                                    info!("Client {} completed segment {} at {} FPS", client_id, segment_id, fps);
+                                    let mut state = state_arc.lock().await;
+                                    state.segment_manager.add_segment(client_id.clone(), segment_id.clone());
+
+                                    let segments_complete = state.segment_manager.get_segment_count() == required_clients;
+                                    info!(
+                                        "Progress: {}/{} segments complete",
+                                        state.segment_manager.get_segment_count(),
+                                        required_clients
+                                    );
+
+                                    if segments_complete {
+                                        info!("All segments received, starting combination...");
+                                        let output_file = state.config.file_name_output.clone();
+                                        let input_file = state.file_path.clone();
+                                        drop(state);
+
+                                        match state_arc.lock().await.segment_manager.combine_segments(&output_file, &input_file).await {
+                                            Ok(_) => {
+                                                info!("Successfully combined segments into: {}", output_file);
+                                                if let Err(e) = sender.send(Message::Close(None)).await {
+                                                    error!("Failed to send close message: {}", e);
+                                                }
+                                                return;
+                                            }
+                                            Err(e) => {
+                                                error!("Failed to combine segments: {}", e);
+                                                return;
+                                            }
+                                        }
+                                    }
+                                }
+                                _ => {}
                             }
                         }
                     }
+                    Some(Ok(Message::Close(_))) => {
+                        info!("Client {} requested close", client_id);
+                        break;
+                    }
                     Some(Err(e)) => {
-                        warn!("WebSocket error for client {}: {}", client_id, e);
+                        error!("WebSocket error for client {}: {}", client_id, e);
                         break;
                     }
                     None => break,
+                    _ => {}
                 }
             }
-            Ok(msg) = broadcast_rx.recv() => {
-                match msg.target {
-                    Some(target) if target != client_id => continue,
-                    _ => {
-                        if let Err(e) = sender.send(axum::extract::ws::Message::Text(msg.content.into())).await {
-                            warn!("Failed to send broadcast message to client {}: {}", client_id, e);
-                            break;
-                        }
+            Ok(broadcast_msg) = broadcast_rx.recv() => {
+                // Only process messages meant for all clients or this specific client
+                if broadcast_msg.target.is_none() || broadcast_msg.target.as_ref() == Some(&client_id) {
+                    if let Err(e) = sender.send(Message::Text(broadcast_msg.content)).await {
+                        error!("Failed to send broadcast message to {}: {}", client_id, e);
+                        break;
                     }
                 }
             }
         }
     }
 
-    // Clean up
+    // Cleanup on disconnect
     info!("Client {} disconnected", client_id);
     let mut state = state_arc.lock().await;
-    state.clients.remove(&client_id);
+    if !state.segment_manager.has_segment(&client_id) {
+        state.clients.remove(&client_id);
+        state.client_segments.remove(&client_id);
+        info!(
+            "Removed disconnected client {}. Remaining clients: {}/{}",
+            client_id,
+            state.clients.len(),
+            required_clients
+        );
+    }
 }

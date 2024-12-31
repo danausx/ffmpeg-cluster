@@ -1,4 +1,5 @@
 use axum::{
+    extract::DefaultBodyLimit,
     routing::{get, post},
     Router,
 };
@@ -57,7 +58,7 @@ pub struct AppState {
 
 #[tokio::main]
 async fn main() {
-    // Initialize better logging
+    // Initialize logging
     FmtSubscriber::builder()
         .with_max_level(Level::INFO)
         .with_target(false)
@@ -148,7 +149,7 @@ async fn main() {
         broadcast_tx: tx,
     }));
 
-    // Initialize the segment manager
+    // Initialize segment manager
     {
         let state = state.lock().await;
         if let Err(e) = state.segment_manager.init().await {
@@ -157,12 +158,13 @@ async fn main() {
         }
     }
 
-    // Setup server
+    // Setup server with large body limit
     let app = Router::new()
         .route("/ws", get(ws_handler))
         .route("/upload", post(upload_handler))
         .nest_service("/files", ServeDir::new("."))
         .layer(CorsLayer::permissive())
+        .layer(DefaultBodyLimit::max(1024 * 1024 * 1024 * 2)) // 2GB limit
         .with_state(state.clone());
 
     let addr = format!("0.0.0.0:{}", args.port);

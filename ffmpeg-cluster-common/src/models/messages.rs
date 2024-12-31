@@ -8,12 +8,6 @@ pub struct FfmpegParams {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ClientConfig {
-    pub client_id: String,
-    pub fps: f64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ClientMessage {
     RequestId,
     BenchmarkResult { fps: f64 },

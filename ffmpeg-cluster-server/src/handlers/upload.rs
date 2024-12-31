@@ -1,81 +1,137 @@
 use crate::AppState;
 use axum::{
-    extract::{Multipart, State},
+    body::Bytes,
+    extract::State,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
-use std::io;
-use std::{path::Path, sync::Arc};
+use std::sync::Arc;
 use tokio::{fs::File, io::AsyncWriteExt, sync::Mutex};
-use tracing::{info, warn};
+use tracing::{error, info};
 
 pub async fn upload_handler(
     State(state): State<Arc<Mutex<AppState>>>,
-    mut multipart: Multipart,
+    headers: HeaderMap,
+    body: Bytes,
 ) -> impl IntoResponse {
-    // Get the job's work directory
     let work_dir = {
         let state = state.lock().await;
         state.segment_manager.get_work_dir().to_path_buf()
     };
 
+    // Create work directory if it doesn't exist
     if !work_dir.exists() {
         if let Err(e) = tokio::fs::create_dir_all(&work_dir).await {
-            warn!("Failed to create work directory: {}", e);
-            return format!("Failed to create work directory: {}", e).into_response();
+            error!("Failed to create work directory: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to create work directory: {}", e),
+            )
+                .into_response();
         }
     }
 
-    while let Ok(Some(field)) = multipart.next_field().await {
-        let file_name = match field.file_name() {
-            Some(name) => name.to_string(),
-            None => continue,
-        };
+    // Get filename from headers
+    let file_name = match headers.get("file-name").and_then(|h| h.to_str().ok()) {
+        Some(name) if !name.is_empty() => name.to_string(),
+        _ => {
+            error!("No valid filename provided in headers");
+            return (StatusCode::BAD_REQUEST, "No valid filename provided").into_response();
+        }
+    };
 
-        info!("Receiving upload: {}", file_name);
+    let file_path = work_dir.join(&file_name);
+    info!("Receiving upload: {} ({} bytes)", file_name, body.len());
 
-        let data = match field.bytes().await {
-            Ok(data) => data,
-            Err(e) => {
-                warn!("Failed to read file data: {}", e);
-                return format!("Failed to read file data: {}", e).into_response();
+    // Save the file
+    let mut file = match File::create(&file_path).await {
+        Ok(file) => file,
+        Err(e) => {
+            error!("Failed to create file: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to create file: {}", e),
+            )
+                .into_response();
+        }
+    };
+
+    // Write the data
+    if let Err(e) = file.write_all(&body).await {
+        error!("Failed to write file: {}", e);
+        let _ = tokio::fs::remove_file(&file_path).await;
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to write file: {}", e),
+        )
+            .into_response();
+    }
+
+    // Ensure data is written to disk
+    if let Err(e) = file.sync_all().await {
+        error!("Failed to sync file: {}", e);
+        let _ = tokio::fs::remove_file(&file_path).await;
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to sync file: {}", e),
+        )
+            .into_response();
+    }
+
+    // Wait a moment to ensure the file is fully written
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    // Verify the file was written correctly
+    match tokio::fs::metadata(&file_path).await {
+        Ok(metadata) => {
+            if metadata.len() == 0 {
+                error!("Uploaded file is empty: {}", file_name);
+                let _ = tokio::fs::remove_file(&file_path).await;
+                return (StatusCode::BAD_REQUEST, "Uploaded file is empty").into_response();
             }
-        };
-
-        let file_path = work_dir.join(&file_name);
-        info!("Saving to: {}", file_path.display());
-
-        // Write the file
-        if let Err(e) = write_file(&file_path, &data).await {
-            warn!("Failed to write file: {}", e);
-            return format!("Failed to write file: {}", e).into_response();
+            if metadata.len() != body.len() as u64 {
+                error!(
+                    "File size mismatch: expected {}, got {}",
+                    body.len(),
+                    metadata.len()
+                );
+                let _ = tokio::fs::remove_file(&file_path).await;
+                return (StatusCode::BAD_REQUEST, "File size mismatch").into_response();
+            }
+            info!(
+                "Successfully saved file {} ({} bytes)",
+                file_path.display(),
+                metadata.len()
+            );
         }
-
-        // Associate the uploaded segment with the correct client
-        let mut state = state.lock().await;
-
-        // First, find the matching client and collect necessary info
-        let matching_client = state
-            .client_segments
-            .iter()
-            .find(|(_, segment)| segment == &&file_name)
-            .map(|(client_id, _)| client_id.clone());
-
-        // Then update the segment manager if we found a match
-        if let Some(client_id) = matching_client {
-            state
-                .segment_manager
-                .add_segment(client_id.clone(), file_name.clone());
-            info!("Registered segment {} for client {}", file_name, client_id);
-        } else {
-            warn!("No client found for segment {}", file_name);
+        Err(e) => {
+            error!("Failed to verify file: {}", e);
+            let _ = tokio::fs::remove_file(&file_path).await;
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to verify file: {}", e),
+            )
+                .into_response();
         }
     }
 
-    "Upload complete".into_response()
-}
+    // Associate segment with client
+    let mut state = state.lock().await;
+    let matching_client = state
+        .client_segments
+        .iter()
+        .find(|(_, segment)| segment == &&file_name)
+        .map(|(client_id, _)| client_id.clone());
 
-async fn write_file(path: &Path, data: &[u8]) -> io::Result<()> {
-    let mut file = File::create(path).await?;
-    file.write_all(data).await?;
-    Ok(())
+    if let Some(client_id) = matching_client {
+        state
+            .segment_manager
+            .add_segment(client_id.clone(), file_name.clone());
+        info!("Successfully registered segment for client {}", client_id);
+        (StatusCode::OK, "Upload complete").into_response()
+    } else {
+        error!("No client found for segment {}", file_name);
+        let _ = tokio::fs::remove_file(&file_path).await;
+        (StatusCode::BAD_REQUEST, "No client found for segment").into_response()
+    }
 }
