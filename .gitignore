@@ -101,4 +101,5 @@ flake.lock
 *.mp4
 work/
 uploads/
+output/
 Cargo.lock

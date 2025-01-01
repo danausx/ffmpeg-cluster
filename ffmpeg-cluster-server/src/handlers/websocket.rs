@@ -300,16 +300,15 @@ async fn distribute_segments(
     job_id: &str,
     client_ids: &[String],
 ) -> Result<(), anyhow::Error> {
-    let (input_file, total_frames) = {
+    let (input_file, fps, total_frames) = {
         let state = state_arc.lock().await;
         if let Some(input) = state.current_input.as_ref() {
             match crate::services::ffmpeg::FfmpegService::get_video_info(
-                input,
-                state.config.exactly,
+                input, true, // Set exactly=true for frame-accurate counting
             )
             .await
             {
-                Ok((_, _, frames)) => (input.clone(), frames),
+                Ok((fps, _, frames)) => (input.clone(), fps, frames),
                 Err(e) => {
                     error!("Failed to get video info: {}", e);
                     return Err(anyhow::anyhow!("Failed to get video info: {}", e));
@@ -320,15 +319,27 @@ async fn distribute_segments(
         }
     };
 
+    // Ensure frame-accurate distribution
     let frames_per_client = total_frames / client_ids.len() as u64;
+    let mut remaining_frames = total_frames % client_ids.len() as u64;
 
+    let mut current_frame = 0;
     for (i, client_id) in client_ids.iter().enumerate() {
-        let start_frame = i as u64 * frames_per_client;
-        let end_frame = if i == client_ids.len() - 1 {
-            total_frames
-        } else {
-            (i as u64 + 1) * frames_per_client
-        };
+        // Calculate frames for this segment
+        let mut segment_frames = frames_per_client;
+        if remaining_frames > 0 {
+            segment_frames += 1;
+            remaining_frames -= 1;
+        }
+
+        let start_frame = current_frame;
+        let end_frame = start_frame + segment_frames;
+        current_frame = end_frame;
+
+        info!(
+            "Distributing frames {} to {} to client {}",
+            start_frame, end_frame, client_id
+        );
 
         let segment_data = {
             let mut state = state_arc.lock().await;
@@ -569,14 +580,16 @@ async fn handle_all_segments_complete(
     state: &mut AppState,
     job_id: &str,
 ) -> Result<(), anyhow::Error> {
-    info!("Starting final segment combination for job {}", job_id);
+    info!("Starting final segment combination...");
     let output_file = state.config.file_name_output.clone();
 
-    info!("Combining segments into output file: {}", output_file);
     match state.segment_manager.combine_segments(&output_file).await {
         Ok(_) => {
+            info!("Successfully combined segments into: {}", output_file);
+
+            // Verify the output file exists and has content
             if let Ok(metadata) = tokio::fs::metadata(&output_file).await {
-                info!("Successfully created output file: {} bytes", metadata.len());
+                info!("Output file size: {} bytes", metadata.len());
             }
 
             // Mark job as completed
@@ -585,15 +598,13 @@ async fn handle_all_segments_complete(
 
             // Reset state for next job
             state.current_job = None;
-
-            // Create new segment manager
             state.segment_manager = SegmentManager::new(None);
             if let Err(e) = state.segment_manager.init().await {
                 error!("Failed to initialize new segment manager: {}", e);
                 return Err(e.into());
             }
 
-            // Send completion message to all clients
+            // Notify clients
             let completion_msg = ServerMessage::JobComplete {
                 job_id: job_id.to_string(),
             };
@@ -606,8 +617,6 @@ async fn handle_all_segments_complete(
 
                 if let Err(e) = state.broadcast_tx.send(broadcast_msg) {
                     error!("Failed to broadcast job completion: {}", e);
-                } else {
-                    info!("Successfully notified clients of job completion");
                 }
             }
 

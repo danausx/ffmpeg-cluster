@@ -103,7 +103,7 @@ impl SegmentManager {
     // Update the combine_segments method
     pub async fn combine_segments(&self, output_file: &str) -> Result<()> {
         info!(
-            "Starting segment combination process for job {} with {} segments...",
+            "Starting frame-accurate segment combination for job {} with {} segments...",
             self.job_id,
             self.segments.len()
         );
@@ -118,54 +118,49 @@ impl SegmentManager {
                 .unwrap_or(0)
         });
 
-        info!("Sorted {} segments for combination", segments.len());
-        for (i, segment) in segments.iter().enumerate() {
-            info!(
-                "Segment {}: {} (size: {} bytes)",
-                i,
-                segment.segment_id,
-                segment.data.len()
-            );
-        }
-
-        if segments.is_empty() {
-            anyhow::bail!("No segments available for combination");
-        }
-
         // Create segments directory using absolute path
         let segments_dir = self.work_dir.join("segments");
         tokio::fs::create_dir_all(&segments_dir).await?;
-
-        // Convert to absolute paths
         let segments_dir = segments_dir.canonicalize()?;
         let work_dir = self.work_dir.canonicalize()?;
 
+        // Write segments and verify frame counts
+        let mut total_frames = 0;
         let mut segment_paths = Vec::new();
 
-        // Write segments to disk with absolute paths
         for (i, segment) in segments.iter().enumerate() {
             let segment_path = segments_dir.join(format!("segment_{:03}.{}", i, segment.format));
             info!("Writing segment {} to {}", i, segment_path.display());
 
             tokio::fs::write(&segment_path, &segment.data).await?;
 
-            // Verify segment integrity
-            let verify_output = Command::new("ffprobe")
+            // Verify segment frame count
+            let frame_count = Command::new("ffprobe")
                 .args([
                     "-v",
                     "error",
+                    "-select_streams",
+                    "v:0",
+                    "-count_packets",
                     "-show_entries",
-                    "format=duration",
+                    "stream=nb_read_packets",
+                    "-of",
+                    "csv=p=0",
                     segment_path.to_str().unwrap(),
                 ])
                 .output()
                 .await?;
 
-            if !verify_output.status.success() {
-                let err = format!("Failed to verify segment {}", i);
+            if !frame_count.status.success() {
+                let err = format!("Failed to verify segment {} frame count", i);
                 error!("{}", err);
                 return Err(anyhow::anyhow!(err));
             }
+
+            let frames = String::from_utf8(frame_count.stdout)?
+                .trim()
+                .parse::<u64>()?;
+            total_frames += frames;
 
             segment_paths.push(segment_path);
         }
@@ -177,10 +172,9 @@ impl SegmentManager {
             .map(|path| format!("file '{}'\n", path.display()))
             .collect::<String>();
 
-        info!("Writing concat file with content:\n{}", concat_content);
         tokio::fs::write(&concat_file, concat_content).await?;
 
-        // Combine segments using FFmpeg with absolute paths
+        // Combine segments using FFmpeg with frame-accurate settings
         let output = Command::new("ffmpeg")
             .args([
                 "-y",
@@ -190,6 +184,8 @@ impl SegmentManager {
                 "0",
                 "-i",
                 concat_file.to_str().unwrap(),
+                "-vsync",
+                "0", // Ensure frame-accurate output
                 "-c",
                 "copy",
                 output_file,
@@ -203,21 +199,40 @@ impl SegmentManager {
             return Err(anyhow::anyhow!("Failed to combine segments: {}", stderr));
         }
 
-        // Verify output file
-        if let Ok(metadata) = tokio::fs::metadata(output_file).await {
-            info!("Successfully created output file: {} bytes", metadata.len());
+        // Verify final output frame count
+        let final_frame_count = Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-count_packets",
+                "-show_entries",
+                "stream=nb_read_packets",
+                "-of",
+                "csv=p=0",
+                output_file,
+            ])
+            .output()
+            .await?;
 
-            // Clean up temporary files
-            info!("Cleaning up temporary files...");
-            if let Err(e) = tokio::fs::remove_dir_all(&segments_dir).await {
-                warn!("Failed to clean up segments directory: {}", e);
-            }
-            if let Err(e) = tokio::fs::remove_file(&concat_file).await {
-                warn!("Failed to clean up concat file: {}", e);
-            }
+        let final_frames = String::from_utf8(final_frame_count.stdout)?
+            .trim()
+            .parse::<u64>()?;
+
+        if final_frames != total_frames {
+            let err = format!(
+                "Frame count mismatch: expected {} frames but got {} in final output",
+                total_frames, final_frames
+            );
+            error!("{}", err);
+            return Err(anyhow::anyhow!(err));
         }
 
-        info!("Successfully combined all segments");
+        info!(
+            "Successfully combined all segments with {} total frames",
+            total_frames
+        );
         Ok(())
     }
 
@@ -382,7 +397,6 @@ impl SegmentManager {
         start_frame: u64,
         end_frame: u64,
     ) -> Result<SegmentData> {
-        // Detect or use cached format
         let format = if let Some(fmt) = &self.original_format {
             fmt.clone()
         } else {
@@ -390,70 +404,79 @@ impl SegmentManager {
             fmt
         };
 
-        // Get proper extension
-        let (ext, format_opts) = Self::get_output_format(&format);
-
-        // Get video framerate for timestamp calculation
-        let fps_output = Command::new("ffprobe")
+        // Get video stream info
+        let probe_output = Command::new("ffprobe")
             .args([
                 "-v",
                 "error",
                 "-select_streams",
                 "v:0",
                 "-show_entries",
-                "stream=r_frame_rate",
+                "stream=r_frame_rate,avg_frame_rate",
                 "-of",
-                "default=noprint_wrappers=1:nokey=1",
+                "json",
                 input_file,
             ])
             .output()
             .await?;
 
-        let fps_str = String::from_utf8_lossy(&fps_output.stdout);
-        let fps: f64 = {
-            let parts: Vec<f64> = fps_str
-                .trim()
-                .split('/')
-                .map(|x| x.parse::<f64>().unwrap_or(0.0))
-                .collect();
-            if parts.len() == 2 && parts[1] != 0.0 {
-                parts[0] / parts[1]
-            } else {
-                30.0 // fallback
-            }
+        let probe_info: serde_json::Value =
+            serde_json::from_str(&String::from_utf8_lossy(&probe_output.stdout))?;
+
+        // Get both real and average frame rates
+        let r_frame_rate = probe_info["streams"][0]["r_frame_rate"]
+            .as_str()
+            .unwrap_or("0/0");
+        let avg_frame_rate = probe_info["streams"][0]["avg_frame_rate"]
+            .as_str()
+            .unwrap_or("0/0");
+
+        // Calculate the frame rate to use (prefer average frame rate for VFR content)
+        let fps_to_use = if avg_frame_rate != "0/0" {
+            avg_frame_rate.to_string()
+        } else {
+            r_frame_rate.to_string()
         };
 
-        // Convert frame numbers to timestamps
-        let start_time = start_frame as f64 / fps;
-        let duration = (end_frame - start_frame) as f64 / fps;
+        info!(
+            "Input video frame rates - real: {}, avg: {}, using: {}",
+            r_frame_rate, avg_frame_rate, fps_to_use
+        );
 
+        let (ext, format_opts) = Self::get_output_format(&format);
         let segment_id = format!("segment_{}_{}", start_frame, Uuid::new_v4());
         let temp_path = self.work_dir.join(format!("{}.{}", segment_id, ext));
 
-        // Create owned strings for timestamps
-        let start_time_str = start_time.to_string();
-        let duration_str = duration.to_string();
-
-        // Create base arguments vector
+        // Build FFmpeg command focusing only on video
         let mut args = vec![
             "-y".to_string(),
-            "-ss".to_string(),
-            start_time_str,
-            "-t".to_string(),
-            duration_str,
             "-i".to_string(),
             input_file.to_string(),
-            "-c".to_string(),
-            "copy".to_string(),
-            "-avoid_negative_ts".to_string(),
-            "1".to_string(),
-            "-map".to_string(),
-            "0".to_string(),
+            "-vf".to_string(),
+            format!(
+                "select=between(n\\,{}\\,{}),setpts=PTS-STARTPTS",
+                start_frame,
+                end_frame - 1
+            ),
+            "-vsync".to_string(),
+            "passthrough".to_string(),
+            "-an".to_string(), // No audio
+            "-sn".to_string(), // No subtitles
+            "-dn".to_string(), // No data streams
         ];
 
-        // Convert format options to owned strings and extend args
-        let format_opts: Vec<String> = format_opts.iter().map(|&s| s.to_string()).collect();
-        args.extend(format_opts);
+        // Video codec settings
+        args.extend([
+            "-c:v".to_string(),
+            "libx264".to_string(),
+            "-preset".to_string(),
+            "medium".to_string(),
+            "-crf".to_string(),
+            "18".to_string(),
+        ]);
+
+        // Add format specific options
+        args.extend(format_opts.iter().map(|&s| s.to_string()));
         args.push(temp_path.to_str().unwrap().to_string());
 
         info!("Creating segment with args: {:?}", args);
@@ -465,6 +488,36 @@ impl SegmentManager {
             anyhow::bail!("Failed to create segment: {}", stderr);
         }
 
+        // Verify the segment
+        let frame_count = Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-count_packets",
+                "-show_entries",
+                "stream=nb_read_packets",
+                "-of",
+                "csv=p=0",
+                temp_path.to_str().unwrap(),
+            ])
+            .output()
+            .await?;
+
+        let actual_frames = String::from_utf8(frame_count.stdout)?
+            .trim()
+            .parse::<u64>()?;
+        let expected_frames = end_frame - start_frame;
+
+        if actual_frames != expected_frames {
+            anyhow::bail!(
+                "Frame count mismatch: expected {} frames but got {}",
+                expected_frames,
+                actual_frames
+            );
+        }
+
         let data = tokio::fs::read(&temp_path).await?;
 
         // Clean up temporary file
@@ -474,11 +527,10 @@ impl SegmentManager {
 
         Ok(SegmentData {
             data,
-            format: ext.to_string(), // Send the extension instead of raw format
+            format: ext.to_string(),
             segment_id,
         })
     }
-
     pub async fn verify_segment(&self, segment_data: &[u8], temp_dir: &Path) -> Result<u64> {
         let temp_path = temp_dir.join(format!("verify_{}.tmp", Uuid::new_v4()));
         tokio::fs::write(&temp_path, segment_data).await?;

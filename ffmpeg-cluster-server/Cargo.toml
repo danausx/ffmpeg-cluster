@@ -1,5 +1,5 @@
 [package]
-name = "ffmpeg-cluster-server"
+name = "ffmpeg_cluster_server"
 version = "0.1.0"
 edition = "2021"
 
@@ -23,3 +23,8 @@ mime_guess = "2.0"
 lazy_static = "1.4"
 tempfile = "3.2"
 futures-util = "0.3"
+[dev-dependencies]
+tokio-test = "0.4"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio-tungstenite = { version = "0.26.1", features = ["native-tls"] }
+anyhow = "1.0"
