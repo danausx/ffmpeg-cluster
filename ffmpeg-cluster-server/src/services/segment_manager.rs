@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use bytes::Bytes;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
@@ -17,29 +17,76 @@ pub struct SegmentData {
 }
 
 pub struct SegmentManager {
-    segments: HashMap<String, SegmentData>,
+    segments: HashMap<String, SegmentData>, // client_id -> segment data
+    pending_segments: HashSet<String>,      // segment_ids that are pending
+    completed_segments: HashSet<String>,    // segment_ids that are completed
     job_id: String,
     base_dir: PathBuf,
     work_dir: PathBuf,
     original_format: Option<String>,
+    total_segments: usize,
 }
 
 impl SegmentManager {
-    pub fn new() -> Self {
-        let job_id = Uuid::new_v4().to_string();
+    pub fn new(job_id: Option<String>) -> Self {
+        let job_id = job_id.unwrap_or_else(|| Uuid::new_v4().to_string());
         let base_dir = PathBuf::from("work").join("server");
         let work_dir = base_dir.join(&job_id);
 
         Self {
             segments: HashMap::new(),
+            pending_segments: HashSet::new(),
+            completed_segments: HashSet::new(),
             job_id,
             base_dir,
             work_dir,
             original_format: None,
+            total_segments: 0,
         }
     }
 
+    pub fn set_job_id(&mut self, job_id: String) {
+        info!(
+            "Updating segment manager job ID from {} to {}",
+            self.job_id, job_id
+        );
+        self.job_id = job_id;
+        self.work_dir = self.base_dir.join(&self.job_id);
+    }
+
+    pub fn add_pending_segment(&mut self, segment_id: String) {
+        self.pending_segments.insert(segment_id);
+        self.total_segments = self.pending_segments.len();
+    }
+
+    pub fn add_processed_segment(&mut self, client_id: String, segment_data: SegmentData) {
+        info!(
+            "Adding processed segment for client {} in job {}: {} (size: {} bytes)",
+            client_id,
+            self.job_id,
+            segment_data.segment_id,
+            segment_data.data.len()
+        );
+
+        self.completed_segments
+            .insert(segment_data.segment_id.clone());
+        self.segments.insert(client_id, segment_data);
+    }
+
+    pub fn get_completion_percentage(&self) -> f32 {
+        if self.total_segments == 0 {
+            0.0
+        } else {
+            (self.completed_segments.len() as f32 / self.total_segments as f32) * 100.0
+        }
+    }
+
+    pub fn is_job_complete(&self) -> bool {
+        !self.pending_segments.is_empty() && self.completed_segments.len() == self.total_segments
+    }
     pub async fn init(&self) -> Result<()> {
+        info!("Initializing segment manager for job {}", self.job_id);
+
         if !self.base_dir.exists() {
             tokio::fs::create_dir_all(&self.base_dir).await?;
             info!("Created server base directory: {}", self.base_dir.display());
@@ -258,13 +305,6 @@ impl SegmentManager {
             segment_id,
         })
     }
-    pub fn add_processed_segment(&mut self, client_id: String, segment_data: SegmentData) {
-        info!(
-            "Adding processed segment for client {} in job {}: {}",
-            client_id, self.job_id, segment_data.segment_id
-        );
-        self.segments.insert(client_id, segment_data);
-    }
 
     pub async fn verify_segment(&self, segment_data: &[u8], temp_dir: &Path) -> Result<u64> {
         let temp_path = temp_dir.join(format!("verify_{}.tmp", Uuid::new_v4()));
@@ -303,43 +343,124 @@ impl SegmentManager {
     }
 
     pub async fn combine_segments(&self, output_file: &str) -> Result<()> {
-        info!("Combining segments into {}", output_file);
+        info!(
+            "Starting segment combination process for job {} with {} segments...",
+            self.job_id,
+            self.segments.len()
+        );
 
-        // Sort segments by frame number
+        // Debug print all segments
+        for (client_id, segment) in &self.segments {
+            info!(
+                "Segment from client {}: {} (size: {} bytes)",
+                client_id,
+                segment.segment_id,
+                segment.data.len()
+            );
+        }
+
+        // Sort segments by frame number (extract from segment_id)
         let mut segments: Vec<_> = self.segments.values().collect();
-        segments.sort_by(|a, b| {
-            let get_frame_num = |s: &str| {
-                s.split('_')
-                    .nth(1)
-                    .and_then(|n| n.parse::<u64>().ok())
-                    .unwrap_or(0)
-            };
-            get_frame_num(&a.segment_id).cmp(&get_frame_num(&b.segment_id))
+        segments.sort_by_key(|s| {
+            s.segment_id
+                .split('_')
+                .nth(1)
+                .and_then(|n| n.parse::<u64>().ok())
+                .unwrap_or(0)
         });
 
         if segments.is_empty() {
             anyhow::bail!("No segments to combine");
         }
 
-        let temp_dir = tempfile::tempdir()?;
-        let (ext, format_opts) = Self::get_output_format(&segments[0].format);
+        // Create a temporary directory for segments
+        let segments_dir = self.work_dir.join("segments");
+        info!("Creating segments directory at: {}", segments_dir.display());
 
-        // Create temporary files for segments
+        if !segments_dir.exists() {
+            tokio::fs::create_dir_all(&segments_dir)
+                .await
+                .map_err(|e| {
+                    error!("Failed to create segments directory: {}", e);
+                    e
+                })?;
+        }
+
+        // Write segments to disk
         let mut segment_paths = Vec::new();
         for (i, segment) in segments.iter().enumerate() {
-            let temp_path = temp_dir.path().join(format!("segment_{}.{}", i, ext));
-            tokio::fs::write(&temp_path, &segment.data).await?;
-            segment_paths.push(temp_path);
+            let segment_path = segments_dir.join(format!("segment_{}.{}", i, segment.format));
+            info!(
+                "Writing segment {} ({}) to {}",
+                i,
+                segment.segment_id,
+                segment_path.display()
+            );
+
+            tokio::fs::write(&segment_path, &segment.data)
+                .await
+                .map_err(|e| {
+                    error!("Failed to write segment {} to disk: {}", i, e);
+                    e
+                })?;
+
+            // Verify the segment was written correctly
+            if !segment_path.exists() {
+                let err = format!("Failed to verify segment {} on disk", i);
+                error!("{}", err);
+                anyhow::bail!(err);
+            }
+
+            // Verify segment integrity with ffprobe
+            let probe_output = Command::new("ffprobe")
+                .args([
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "format=duration",
+                    segment_path.to_str().unwrap(),
+                ])
+                .output()
+                .await
+                .map_err(|e| {
+                    error!("Failed to probe segment {}: {}", i, e);
+                    e
+                })?;
+
+            if !probe_output.status.success() {
+                let err = format!(
+                    "Segment {} is corrupted: {}",
+                    i,
+                    String::from_utf8_lossy(&probe_output.stderr)
+                );
+                error!("{}", err);
+                anyhow::bail!(err);
+            }
+
+            segment_paths.push(segment_path);
         }
 
         // Create concat file
-        let concat_file = temp_dir.path().join("concat.txt");
+        let concat_file = self.work_dir.join("concat.txt");
+        info!("Creating concat file at: {}", concat_file.display());
+
         let concat_content = segment_paths
             .iter()
             .map(|path| format!("file '{}'\n", path.display()))
             .collect::<String>();
 
-        tokio::fs::write(&concat_file, concat_content).await?;
+        tokio::fs::write(&concat_file, concat_content)
+            .await
+            .map_err(|e| {
+                error!("Failed to write concat file: {}", e);
+                e
+            })?;
+
+        info!(
+            "Created concat file with {} segments at {}",
+            segment_paths.len(),
+            concat_file.display()
+        );
 
         // Combine segments
         let mut args = vec![
@@ -353,17 +474,32 @@ impl SegmentManager {
             "-c",
             "copy",
         ];
-        args.extend(format_opts.iter());
         args.push(output_file);
 
-        let output = Command::new("ffmpeg").args(&args).output().await?;
+        info!("Running ffmpeg with args: {:?}", args);
+
+        let output = Command::new("ffmpeg")
+            .args(&args)
+            .output()
+            .await
+            .map_err(|e| {
+                error!("Failed to execute ffmpeg: {}", e);
+                e
+            })?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
+            error!("FFmpeg combination failed: {}", stderr);
             anyhow::bail!("Failed to combine segments: {}", stderr);
         }
 
-        // Verify final output
+        // Verify final output exists and is valid
+        if !Path::new(output_file).exists() {
+            let err = format!("Output file {} was not created", output_file);
+            error!("{}", err);
+            anyhow::bail!(err);
+        }
+
         let verify_output = Command::new("ffprobe")
             .args([
                 "-v",
@@ -377,7 +513,11 @@ impl SegmentManager {
                 output_file,
             ])
             .output()
-            .await?;
+            .await
+            .map_err(|e| {
+                error!("Failed to verify output file: {}", e);
+                e
+            })?;
 
         if verify_output.status.success() {
             let duration = String::from_utf8_lossy(&verify_output.stdout)
@@ -385,8 +525,25 @@ impl SegmentManager {
                 .parse::<f64>()
                 .unwrap_or(0.0);
             info!("Final output duration: {:.2} seconds", duration);
+        } else {
+            let err = format!(
+                "Failed to verify output file: {}",
+                String::from_utf8_lossy(&verify_output.stderr)
+            );
+            error!("{}", err);
+            anyhow::bail!(err);
         }
 
+        // Clean up temporary files
+        info!("Cleaning up temporary files...");
+        if let Err(e) = tokio::fs::remove_dir_all(&segments_dir).await {
+            warn!("Failed to clean up segments directory: {}", e);
+        }
+        if let Err(e) = tokio::fs::remove_file(&concat_file).await {
+            warn!("Failed to clean up concat file: {}", e);
+        }
+
+        info!("Segment combination completed successfully");
         Ok(())
     }
 

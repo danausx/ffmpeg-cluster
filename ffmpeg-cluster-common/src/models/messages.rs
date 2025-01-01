@@ -143,4 +143,7 @@ pub enum ServerMessage {
         code: String,
         message: String,
     },
+    JobComplete {
+        job_id: String,
+    },
 }

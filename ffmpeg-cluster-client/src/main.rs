@@ -38,6 +38,7 @@ struct ClientState {
     job_id: Option<String>,
     processor: Option<FfmpegProcessor>,
     benchmark_completed: bool,
+    current_segment: Option<String>,
 }
 
 impl ClientState {
@@ -47,12 +48,25 @@ impl ClientState {
             job_id: None,
             processor: None,
             benchmark_completed: false,
+            current_segment: None,
         }
     }
 
     fn reset_job_state(&mut self) {
         self.job_id = None;
         self.benchmark_completed = false;
+        self.current_segment = None;
+    }
+
+    fn set_job_id(&mut self, job_id: &str) {
+        if self
+            .job_id
+            .as_ref()
+            .map_or(true, |current| current != job_id)
+        {
+            self.job_id = Some(job_id.to_string());
+            self.benchmark_completed = false; // Reset benchmark flag for new job
+        }
     }
 }
 
@@ -113,7 +127,7 @@ async fn handle_connection(
                             }
                         }
 
-                        state.job_id = Some(job_id.clone());
+                        state.set_job_id(&job_id); // Use new method to set job_id
                     }
                     ServerMessage::ClientIdle { id } => {
                         info!("Received idle state with client ID: {}", id);
@@ -124,7 +138,7 @@ async fn handle_connection(
                                 state.processor = Some(proc);
                             }
                         }
-                        state.reset_job_state();
+                        state.reset_job_state(); // Reset state when idle
                     }
                     ServerMessage::BenchmarkRequest {
                         data,
@@ -132,6 +146,9 @@ async fn handle_connection(
                         params,
                         job_id,
                     } => {
+                        // Update job ID if it's different
+                        state.set_job_id(&job_id);
+
                         // Store metadata for binary chunks
                         chunk_state.current_job_id = Some(job_id.clone());
                         chunk_state.current_format = Some(format);
@@ -152,40 +169,40 @@ async fn handle_connection(
                         params,
                         job_id,
                     } => {
-                        if state.job_id.is_some() {
-                            info!("Processing segment: {}", segment_id);
-                            if let Some(proc) = &mut state.processor {
-                                match proc
-                                    .process_segment_data(&data, &format, &segment_id, &params)
-                                    .await
-                                {
-                                    Ok((processed_data, fps)) => {
-                                        info!("Segment processing complete: {} FPS", fps);
-                                        let response = ClientMessage::SegmentComplete {
-                                            segment_id: segment_id.clone(),
-                                            fps,
-                                            data: processed_data,
-                                            format: format.clone(),
-                                        };
-                                        let msg = serde_json::to_string(&response)?;
-                                        write.send(Message::Text(msg.into())).await?;
-                                    }
-                                    Err(e) => {
-                                        error!("Segment processing failed: {}", e);
-                                        let response = ClientMessage::SegmentFailed {
-                                            error: e.to_string(),
-                                        };
-                                        let msg = serde_json::to_string(&response)?;
-                                        write.send(Message::Text(msg.into())).await?;
-                                    }
+                        state.set_job_id(&job_id); // Update job ID
+
+                        if let Some(proc) = &mut state.processor {
+                            match proc
+                                .process_segment_data(&data, &format, &segment_id, &params)
+                                .await
+                            {
+                                Ok((processed_data, fps)) => {
+                                    info!("Segment processing complete: {} FPS", fps);
+                                    let response = ClientMessage::SegmentComplete {
+                                        segment_id: segment_id.clone(),
+                                        fps,
+                                        data: processed_data,
+                                        format: format.clone(),
+                                    };
+                                    let msg = serde_json::to_string(&response)?;
+                                    write.send(Message::Text(msg.into())).await?;
+                                }
+                                Err(e) => {
+                                    error!("Segment processing failed: {}", e);
+                                    let response = ClientMessage::SegmentFailed {
+                                        error: e.to_string(),
+                                    };
+                                    let msg = serde_json::to_string(&response)?;
+                                    write.send(Message::Text(msg.into())).await?;
                                 }
                             }
-                        } else {
-                            info!("Ignoring segment processing request as client is idle");
                         }
                     }
                     ServerMessage::Error { code, message } => {
                         error!("Server error: {} - {}", code, message);
+                    }
+                    ServerMessage::JobComplete { job_id } => {
+                        info!("Job {} completed", job_id);
                     }
                 }
             }
@@ -221,7 +238,6 @@ async fn handle_connection(
 
     Ok(())
 }
-
 async fn process_benchmark_data(
     state: &mut ClientState,
     chunk_state: &ChunkState,

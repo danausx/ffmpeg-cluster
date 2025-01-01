@@ -130,7 +130,7 @@ async fn main() {
             key: String::new(),
         },
         clients: HashMap::new(),
-        segment_manager: SegmentManager::new(),
+        segment_manager: SegmentManager::new(None),
         job_queue: JobQueue::new(),
         broadcast_tx: tx,
         current_job: None,

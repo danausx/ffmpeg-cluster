@@ -6,6 +6,7 @@ use axum::{
     },
     response::Response,
 };
+use bytes::Bytes;
 use ffmpeg_cluster_common::models::messages::{
     ClientInfo, ClientStatus, JobConfig, JobStatus, ServerCommand, ServerMessage, ServerResponse,
     VideoData,
@@ -44,7 +45,7 @@ async fn handle_command_socket(
                             message: format!("Invalid command format: {}", e),
                         };
                         if let Ok(response) = serde_json::to_string(&error_response) {
-                            let _ = sender.send(Message::Text(response)).await;
+                            let _ = sender.send(Message::Text(response.into())).await;
                         }
                         continue;
                     }
@@ -69,7 +70,7 @@ async fn handle_command_socket(
                 };
 
                 if let Ok(response_str) = serde_json::to_string(&response) {
-                    if let Err(e) = sender.send(Message::Text(response_str)).await {
+                    if let Err(e) = sender.send(Message::Text(response_str.into())).await {
                         error!("Failed to send response: {}", e);
                         break;
                     }
@@ -133,6 +134,14 @@ async fn handle_process_local_file(
         state.current_input = Some(file_path.clone());
         let job_id = state.job_queue.add_job(path, config, format);
         state.current_job = Some(job_id.clone());
+
+        // Update the segment manager with the new job ID
+        state.segment_manager.set_job_id(job_id.clone());
+        // Reinitialize the segment manager
+        if let Err(e) = state.segment_manager.init().await {
+            error!("Failed to initialize segment manager: {}", e);
+        }
+
         job_id
     };
 

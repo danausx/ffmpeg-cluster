@@ -16,6 +16,7 @@ pub struct Job {
 pub struct JobQueue {
     jobs: HashMap<String, Job>,
     queue: Vec<String>, // Job IDs in order
+    active_job: Option<String>,
 }
 
 impl JobQueue {
@@ -23,6 +24,7 @@ impl JobQueue {
         Self {
             jobs: HashMap::new(),
             queue: Vec::new(),
+            active_job: None,
         }
     }
 
@@ -83,11 +85,17 @@ impl JobQueue {
     }
 
     pub fn get_next_job(&mut self) -> Option<&mut Job> {
-        if let Some(job_id) = self.queue.first() {
-            info!("Getting next job: {}", job_id);
-            self.jobs.get_mut(job_id)
+        if self.active_job.is_none() {
+            if let Some(job_id) = self.queue.first() {
+                let job_id = job_id.clone();
+                self.active_job = Some(job_id.clone());
+                info!("Getting next job: {}", job_id);
+                self.jobs.get_mut(&job_id)
+            } else {
+                info!("No jobs in queue");
+                None
+            }
         } else {
-            info!("No jobs in queue");
             None
         }
     }
@@ -124,9 +132,12 @@ impl JobQueue {
             job.info.completed_at = Some(now);
             job.info.progress = 100.0;
 
-            // Remove from queue
+            // Remove from queue and clear active job
             if let Some(pos) = self.queue.iter().position(|x| x == job_id) {
                 self.queue.remove(pos);
+            }
+            if self.active_job.as_ref() == Some(&job_id.to_string()) {
+                self.active_job = None;
             }
 
             info!("Job {} marked as completed", job_id);
@@ -144,9 +155,12 @@ impl JobQueue {
             job.info.completed_at = Some(now);
             job.info.error = Some(error);
 
-            // Remove from queue
+            // Remove from queue and clear active job
             if let Some(pos) = self.queue.iter().position(|x| x == job_id) {
                 self.queue.remove(pos);
+            }
+            if self.active_job.as_ref() == Some(&job_id.to_string()) {
+                self.active_job = None;
             }
 
             info!("Job {} marked as failed", job_id);
@@ -163,9 +177,12 @@ impl JobQueue {
             job.info.status = JobStatus::Cancelled;
             job.info.completed_at = Some(now);
 
-            // Remove from queue
+            // Remove from queue and clear active job
             if let Some(pos) = self.queue.iter().position(|x| x == job_id) {
                 self.queue.remove(pos);
+                if self.active_job.as_ref() == Some(&job_id.to_string()) {
+                    self.active_job = None;
+                }
                 info!("Job {} cancelled", job_id);
                 return true;
             }
