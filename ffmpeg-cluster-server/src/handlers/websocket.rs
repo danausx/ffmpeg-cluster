@@ -430,7 +430,7 @@ async fn handle_segment_complete(
         segment_id, client_id, fps
     );
 
-    let should_combine = {
+    let (should_combine, current_job_id) = {
         let mut state = state_arc.lock().await;
         let segment_data = SegmentData {
             data,
@@ -442,28 +442,32 @@ async fn handle_segment_complete(
             .segment_manager
             .add_processed_segment(client_id.to_string(), segment_data);
 
-        // Update client performance metrics
         if let Some(perf) = state.clients.get_mut(client_id) {
             *perf = fps;
         }
 
-        // Check if all segments are complete
-        if let Some(job_id) = state.current_job.clone() {
+        let job_id = state.current_job.clone();
+        if let Some(ref job_id) = job_id {
             let completion_percentage = state.segment_manager.get_completion_percentage();
             state
                 .job_queue
-                .update_progress(&job_id, completion_percentage as usize, 100);
-            state.segment_manager.is_job_complete()
-        } else {
-            false
+                .update_progress(job_id, completion_percentage as usize, 100);
         }
+
+        (state.segment_manager.is_job_complete(), job_id)
     };
 
     if should_combine {
-        info!("All segments complete, starting combination process");
-        if let Some(job_id) = state_arc.lock().await.current_job.clone() {
+        if let Some(job_id) = current_job_id {
+            info!(
+                "Starting final segment combination process for job {}",
+                job_id
+            );
             let mut state = state_arc.lock().await;
-            handle_all_segments_complete(&mut state, &job_id).await?;
+            match handle_all_segments_complete(&mut state, &job_id).await {
+                Ok(_) => info!("Successfully completed job {}", job_id),
+                Err(e) => error!("Failed to complete job {}: {}", job_id, e),
+            }
         }
     }
 
@@ -565,80 +569,48 @@ async fn handle_all_segments_complete(
     state: &mut AppState,
     job_id: &str,
 ) -> Result<(), anyhow::Error> {
-    info!("All segments received, starting combination...");
+    info!("Starting final segment combination for job {}", job_id);
     let output_file = state.config.file_name_output.clone();
 
     info!("Combining segments into output file: {}", output_file);
-
     match state.segment_manager.combine_segments(&output_file).await {
         Ok(_) => {
-            info!("Successfully combined segments into: {}", output_file);
-
-            // Verify the output file exists and has content
             if let Ok(metadata) = tokio::fs::metadata(&output_file).await {
-                info!("Output file size: {} bytes", metadata.len());
+                info!("Successfully created output file: {} bytes", metadata.len());
             }
 
-            // Mark current job as completed and clear state
+            // Mark job as completed
             state.job_queue.mark_job_completed(job_id);
             info!("Marked job {} as completed", job_id);
 
+            // Reset state for next job
             state.current_job = None;
 
-            // Reset the segment manager for the next job
-            info!("Resetting segment manager for next job");
+            // Create new segment manager
             state.segment_manager = SegmentManager::new(None);
             if let Err(e) = state.segment_manager.init().await {
                 error!("Failed to initialize new segment manager: {}", e);
                 return Err(e.into());
             }
 
-            // Check for next job in queue
-            if let Some(next_job) = state.job_queue.get_next_job() {
-                let next_job_id = next_job.info.job_id.clone();
-                info!("Starting next job: {}", next_job_id);
+            // Send completion message to all clients
+            let completion_msg = ServerMessage::JobComplete {
+                job_id: job_id.to_string(),
+            };
 
-                state.current_job = Some(next_job_id.clone());
-                state.current_input = Some(next_job.file_path.to_str().unwrap().to_string());
-
-                // Send new job message to all clients
-                let job_msg = ServerMessage::ClientId {
-                    id: "broadcast".to_string(),
-                    job_id: next_job_id.clone(),
+            if let Ok(msg_str) = serde_json::to_string(&completion_msg) {
+                let broadcast_msg = crate::ServerMessage {
+                    target: None,
+                    content: msg_str,
                 };
 
-                if let Ok(msg_str) = serde_json::to_string(&job_msg) {
-                    let broadcast_msg = crate::ServerMessage {
-                        target: None,
-                        content: msg_str,
-                    };
-
-                    if let Err(e) = state.broadcast_tx.send(broadcast_msg) {
-                        error!("Failed to broadcast next job: {}", e);
-                    } else {
-                        info!("Successfully notified clients of next job");
-                    }
-                }
-            } else {
-                info!("No more jobs in queue, sending idle message to clients");
-                // Send idle message to clients
-                let idle_msg = ServerMessage::ClientIdle {
-                    id: "broadcast".to_string(),
-                };
-
-                if let Ok(msg_str) = serde_json::to_string(&idle_msg) {
-                    let broadcast_msg = crate::ServerMessage {
-                        target: None,
-                        content: msg_str,
-                    };
-
-                    if let Err(e) = state.broadcast_tx.send(broadcast_msg) {
-                        error!("Failed to broadcast idle state: {}", e);
-                    } else {
-                        info!("Successfully sent idle message to clients");
-                    }
+                if let Err(e) = state.broadcast_tx.send(broadcast_msg) {
+                    error!("Failed to broadcast job completion: {}", e);
+                } else {
+                    info!("Successfully notified clients of job completion");
                 }
             }
+
             Ok(())
         }
         Err(e) => {
