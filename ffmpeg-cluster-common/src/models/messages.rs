@@ -1,5 +1,3 @@
-// ffmpeg-cluster-common/src/models/messages.rs
-
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -10,18 +8,22 @@ pub struct JobConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VideoData {
+    pub data: Vec<u8>,
+    pub format: String,
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ServerCommand {
-    // File processing commands
     ProcessLocalFile {
         file_path: String,
         config: Option<JobConfig>,
     },
-    ProcessUploadedFile {
-        file_name: String,
+    ProcessVideoData {
+        video_data: VideoData,
         config: Option<JobConfig>,
     },
-
-    // Job control commands
     CancelJob {
         job_id: String,
     },
@@ -29,8 +31,6 @@ pub enum ServerCommand {
         job_id: String,
     },
     ListJobs,
-
-    // Client management
     ListClients,
     DisconnectClient {
         client_id: String,
@@ -39,7 +39,6 @@ pub enum ServerCommand {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ServerResponse {
-    // Job responses
     JobCreated {
         job_id: String,
     },
@@ -50,11 +49,7 @@ pub enum ServerResponse {
         error: Option<String>,
     },
     JobsList(Vec<JobInfo>),
-
-    // Client responses
     ClientsList(Vec<ClientInfo>),
-
-    // Error responses
     Error {
         code: String,
         message: String,
@@ -77,7 +72,7 @@ pub struct ClientInfo {
     pub client_id: String,
     pub connected_at: u64,
     pub current_job: Option<String>,
-    pub performance: Option<f64>, // FPS from benchmark
+    pub performance: Option<f64>,
     pub status: ClientStatus,
 }
 
@@ -102,14 +97,24 @@ pub enum ClientStatus {
     Disconnected,
 }
 
-// Existing message types stay the same
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ClientMessage {
     RequestId,
-    BenchmarkResult { fps: f64 },
-    SegmentComplete { segment_id: String, fps: f64 },
-    SegmentFailed { error: String },
-    Finish { fps: f64 },
+    BenchmarkResult {
+        fps: f64,
+    },
+    SegmentComplete {
+        segment_id: String,
+        fps: f64,
+        data: Vec<u8>,
+        format: String,
+    },
+    SegmentFailed {
+        error: String,
+    },
+    Finish {
+        fps: f64,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -121,16 +126,21 @@ pub enum ServerMessage {
     ClientIdle {
         id: String,
     },
-    StartBenchmark {
-        file_url: String,
+    BenchmarkRequest {
+        data: Vec<u8>,
+        format: String,
         params: Vec<String>,
         job_id: String,
     },
-    AdjustSegment {
-        file_url: String,
+    ProcessSegment {
+        data: Vec<u8>,
+        format: String,
+        segment_id: String,
         params: Vec<String>,
-        start_frame: u64,
-        end_frame: u64,
         job_id: String,
+    },
+    Error {
+        code: String,
+        message: String,
     },
 }

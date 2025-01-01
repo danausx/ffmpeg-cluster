@@ -1,4 +1,4 @@
-use crate::AppState;
+use crate::{services::segment_manager::SegmentManager, AppState};
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -7,7 +7,8 @@ use axum::{
     response::Response,
 };
 use ffmpeg_cluster_common::models::messages::{
-    ClientInfo, ClientStatus, JobConfig, JobStatus, ServerCommand, ServerResponse,
+    ClientInfo, ClientStatus, JobConfig, JobStatus, ServerCommand, ServerMessage, ServerResponse,
+    VideoData,
 };
 use futures::{SinkExt, StreamExt};
 use std::{path::PathBuf, sync::Arc};
@@ -18,7 +19,7 @@ pub async fn command_ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<Arc<Mutex<AppState>>>,
 ) -> Response {
-    ws.on_upgrade(|socket| async {
+    ws.on_upgrade(|socket| async move {
         if let Err(e) = handle_command_socket(socket, state).await {
             error!("Command socket error: {}", e);
         }
@@ -43,7 +44,7 @@ async fn handle_command_socket(
                             message: format!("Invalid command format: {}", e),
                         };
                         if let Ok(response) = serde_json::to_string(&error_response) {
-                            let _ = sender.send(Message::Text(response.into())).await;
+                            let _ = sender.send(Message::Text(response)).await;
                         }
                         continue;
                     }
@@ -53,8 +54,8 @@ async fn handle_command_socket(
                     ServerCommand::ProcessLocalFile { file_path, config } => {
                         handle_process_local_file(file_path, config, &state).await
                     }
-                    ServerCommand::ProcessUploadedFile { file_name, config } => {
-                        handle_process_uploaded_file(file_name, config, &state).await
+                    ServerCommand::ProcessVideoData { video_data, config } => {
+                        handle_process_video_data(video_data, config, &state).await
                     }
                     ServerCommand::CancelJob { job_id } => handle_cancel_job(job_id, &state).await,
                     ServerCommand::GetJobStatus { job_id } => {
@@ -68,11 +69,15 @@ async fn handle_command_socket(
                 };
 
                 if let Ok(response_str) = serde_json::to_string(&response) {
-                    if let Err(e) = sender.send(Message::Text(response_str.into())).await {
+                    if let Err(e) = sender.send(Message::Text(response_str)).await {
                         error!("Failed to send response: {}", e);
                         break;
                     }
                 }
+            }
+            Ok(Message::Binary(data)) => {
+                // Handle binary data if needed for file uploads
+                info!("Received binary data of size: {} bytes", data.len());
             }
             Ok(Message::Close(_)) => {
                 info!("Command connection closed by client");
@@ -102,33 +107,129 @@ async fn handle_process_local_file(
         };
     }
 
-    let mut state = state.lock().await;
-    let config = config.unwrap_or_else(|| JobConfig {
-        ffmpeg_params: vec![
-            "-c:v".to_string(),
-            "libx264".to_string(),
-            "-preset".to_string(),
-            "medium".to_string(),
-        ],
-        required_clients: state.config.required_clients,
-        exactly: true,
-    });
+    let format = match SegmentManager::detect_format(&file_path).await {
+        Ok(fmt) => fmt,
+        Err(e) => {
+            return ServerResponse::Error {
+                code: "FORMAT_DETECTION_FAILED".to_string(),
+                message: format!("Failed to detect file format: {}", e),
+            }
+        }
+    };
 
-    let job_id = state.job_queue.add_job(path, config);
+    let job_id = {
+        let mut state = state.lock().await;
+        let config = config.unwrap_or_else(|| JobConfig {
+            ffmpeg_params: vec![
+                "-c:v".to_string(),
+                "libx264".to_string(),
+                "-preset".to_string(),
+                "medium".to_string(),
+            ],
+            required_clients: state.config.required_clients,
+            exactly: true,
+        });
+
+        state.current_input = Some(file_path.clone());
+        let job_id = state.job_queue.add_job(path, config, format);
+        state.current_job = Some(job_id.clone());
+        job_id
+    };
+
+    // First, send a new job notification to all connected clients
+    let mut state = state.lock().await;
+    if let Some(job) = state.job_queue.get_job(&job_id) {
+        let msg = ServerMessage::ClientId {
+            id: "broadcast".to_string(),
+            job_id: job_id.clone(),
+        };
+
+        let msg_str = match serde_json::to_string(&msg) {
+            Ok(str) => str,
+            Err(e) => {
+                return ServerResponse::Error {
+                    code: "SERIALIZATION_ERROR".to_string(),
+                    message: format!("Failed to serialize job message: {}", e),
+                };
+            }
+        };
+
+        let broadcast_msg = crate::ServerMessage {
+            target: None,
+            content: msg_str,
+        };
+
+        if let Err(e) = state.broadcast_tx.send(broadcast_msg) {
+            error!("Failed to broadcast job assignment: {}", e);
+            return ServerResponse::Error {
+                code: "BROADCAST_ERROR".to_string(),
+                message: format!("Failed to broadcast job assignment: {}", e),
+            };
+        }
+
+        // If we have enough clients, start the benchmark phase immediately
+        if state.clients.len() >= job.config.required_clients {
+            // Create and send benchmark data
+            if let Some(input_file) = state.current_input.as_ref() {
+                match state
+                    .segment_manager
+                    .create_benchmark_sample(input_file, state.config.benchmark_seconds)
+                    .await
+                {
+                    Ok(sample) => {
+                        let benchmark_msg = ServerMessage::BenchmarkRequest {
+                            data: sample.data,
+                            format: sample.format,
+                            params: state
+                                .config
+                                .ffmpeg_params
+                                .split_whitespace()
+                                .map(String::from)
+                                .collect(),
+                            job_id: job_id.clone(),
+                        };
+
+                        if let Ok(msg_str) = serde_json::to_string(&benchmark_msg) {
+                            let broadcast_msg = crate::ServerMessage {
+                                target: None,
+                                content: msg_str,
+                            };
+
+                            if let Err(e) = state.broadcast_tx.send(broadcast_msg) {
+                                error!("Failed to broadcast benchmark request: {}", e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to create benchmark sample: {}", e);
+                    }
+                }
+            }
+        }
+    }
 
     ServerResponse::JobCreated { job_id }
 }
-
-async fn handle_process_uploaded_file(
-    file_name: String,
+async fn handle_process_video_data(
+    video_data: VideoData,
     config: Option<JobConfig>,
     state: &Arc<Mutex<AppState>>,
 ) -> ServerResponse {
-    let path = PathBuf::from("uploads").join(&file_name);
-    if !path.exists() {
+    let temp_dir = PathBuf::from("work").join("server").join("uploads");
+    if !temp_dir.exists() {
+        if let Err(e) = tokio::fs::create_dir_all(&temp_dir).await {
+            return ServerResponse::Error {
+                code: "DIRECTORY_CREATE_FAILED".to_string(),
+                message: format!("Failed to create upload directory: {}", e),
+            };
+        }
+    }
+
+    let file_path = temp_dir.join(&video_data.id);
+    if let Err(e) = tokio::fs::write(&file_path, &video_data.data).await {
         return ServerResponse::Error {
-            code: "FILE_NOT_FOUND".to_string(),
-            message: format!("Uploaded file not found: {}", file_name),
+            code: "FILE_WRITE_FAILED".to_string(),
+            message: format!("Failed to write uploaded file: {}", e),
         };
     }
 
@@ -144,7 +245,10 @@ async fn handle_process_uploaded_file(
         exactly: true,
     });
 
-    let job_id = state.job_queue.add_job(path, config);
+    state.current_input = Some(file_path.to_str().unwrap().to_string());
+    let job_id = state
+        .job_queue
+        .add_job(file_path, config, video_data.format);
 
     ServerResponse::JobCreated { job_id }
 }
@@ -200,8 +304,8 @@ async fn handle_list_clients(state: &Arc<Mutex<AppState>>) -> ServerResponse {
         .iter()
         .map(|(id, performance)| ClientInfo {
             client_id: id.clone(),
-            connected_at: now, // In a real implementation, you'd track the actual connection time
-            current_job: state.client_segments.get(id).cloned(),
+            connected_at: now,
+            current_job: state.current_job.clone(),
             performance: Some(*performance),
             status: if *performance > 0.0 {
                 ClientStatus::Processing
@@ -220,8 +324,8 @@ async fn handle_disconnect_client(
 ) -> ServerResponse {
     let mut state = state.lock().await;
     if state.clients.remove(&client_id).is_some() {
-        state.client_segments.remove(&client_id);
-        ServerResponse::ClientsList(Vec::new()) // Return empty list as acknowledgment
+        info!("Disconnected client: {}", client_id);
+        ServerResponse::ClientsList(Vec::new())
     } else {
         ServerResponse::Error {
             code: "CLIENT_NOT_FOUND".to_string(),

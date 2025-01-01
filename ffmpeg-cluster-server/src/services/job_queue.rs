@@ -10,6 +10,7 @@ pub struct Job {
     pub info: JobInfo,
     pub file_path: PathBuf,
     pub config: JobConfig,
+    pub format: String,
 }
 
 pub struct JobQueue {
@@ -28,8 +29,6 @@ impl JobQueue {
     pub fn list_jobs(&self) -> Vec<JobInfo> {
         info!("Listing jobs. Current queue size: {}", self.jobs.len());
         let mut jobs: Vec<JobInfo> = self.jobs.values().map(|job| job.info.clone()).collect();
-
-        // Sort by creation time, most recent first
         jobs.sort_by(|a, b| b.created_at.cmp(&a.created_at));
 
         for job in &jobs {
@@ -42,31 +41,7 @@ impl JobQueue {
         jobs
     }
 
-    pub fn update_progress(
-        &mut self,
-        job_id: &str,
-        completed_segments: usize,
-        total_segments: usize,
-    ) {
-        if let Some(job) = self.jobs.get_mut(job_id) {
-            if total_segments > 0 {
-                job.info.progress = (completed_segments as f32 / total_segments as f32) * 100.0;
-                info!("Updated job {} progress: {:.1}%", job_id, job.info.progress);
-            }
-        }
-    }
-
-    pub fn get_next_job(&mut self) -> Option<&mut Job> {
-        if let Some(job_id) = self.queue.first() {
-            info!("Getting next job: {}", job_id);
-            self.jobs.get_mut(job_id)
-        } else {
-            info!("No jobs in queue");
-            None
-        }
-    }
-
-    pub fn add_job(&mut self, file_path: PathBuf, config: JobConfig) -> String {
+    pub fn add_job(&mut self, file_path: PathBuf, config: JobConfig, format: String) -> String {
         let job_id = Uuid::new_v4().to_string();
         info!("Adding new job {} for file {:?}", job_id, file_path);
 
@@ -93,6 +68,7 @@ impl JobQueue {
             info: job_info,
             file_path,
             config,
+            format,
         };
 
         self.jobs.insert(job_id.clone(), job);
@@ -104,6 +80,30 @@ impl JobQueue {
             self.queue.len()
         );
         job_id
+    }
+
+    pub fn get_next_job(&mut self) -> Option<&mut Job> {
+        if let Some(job_id) = self.queue.first() {
+            info!("Getting next job: {}", job_id);
+            self.jobs.get_mut(job_id)
+        } else {
+            info!("No jobs in queue");
+            None
+        }
+    }
+
+    pub fn update_progress(
+        &mut self,
+        job_id: &str,
+        completed_segments: usize,
+        total_segments: usize,
+    ) {
+        if let Some(job) = self.jobs.get_mut(job_id) {
+            if total_segments > 0 {
+                job.info.progress = (completed_segments as f32 / total_segments as f32) * 100.0;
+                info!("Updated job {} progress: {:.1}%", job_id, job.info.progress);
+            }
+        }
     }
 
     pub fn mark_job_started(&mut self, job_id: &str) {
@@ -173,13 +173,23 @@ impl JobQueue {
         false
     }
 
-    pub fn update_job_progress(&mut self, job_id: &str, progress: f32) {
-        if let Some(job) = self.jobs.get_mut(job_id) {
-            job.info.progress = progress;
+    pub fn notify_new_job(&mut self) -> Option<(String, JobConfig, String)> {
+        if let Some(job) = self.queue.first().and_then(|id| self.jobs.get(id)) {
+            Some((
+                job.info.job_id.clone(),
+                job.config.clone(),
+                job.format.clone(),
+            ))
+        } else {
+            None
         }
     }
 
     pub fn get_job(&self, job_id: &str) -> Option<&Job> {
         self.jobs.get(job_id)
+    }
+
+    pub fn get_job_mut(&mut self, job_id: &str) -> Option<&mut Job> {
+        self.jobs.get_mut(job_id)
     }
 }

@@ -1,4 +1,4 @@
-use crate::AppState;
+use crate::{services::segment_manager::SegmentData, AppState};
 use axum::{
     body::Bytes,
     extract::State,
@@ -14,12 +14,13 @@ pub async fn upload_handler(
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
+    // Get work directory from state
     let work_dir = {
         let state = state.lock().await;
         state.segment_manager.get_work_dir().to_path_buf()
     };
 
-    // Create work directory if it doesn't exist
+    // Ensure work directory exists
     if !work_dir.exists() {
         if let Err(e) = tokio::fs::create_dir_all(&work_dir).await {
             error!("Failed to create work directory: {}", e);
@@ -40,8 +41,40 @@ pub async fn upload_handler(
         }
     };
 
+    // Strip "encoded_" prefix if present for segment lookup
+    let lookup_name = file_name
+        .strip_prefix("encoded_")
+        .unwrap_or(&file_name)
+        .to_string();
+
     let file_path = work_dir.join(&file_name);
     info!("Receiving upload: {} ({} bytes)", file_name, body.len());
+
+    if body.len() == 0 {
+        return (StatusCode::BAD_REQUEST, "File is empty").into_response();
+    }
+
+    // Look for client owning this segment
+    let client_id = {
+        let state = state.lock().await;
+        state
+            .client_segments
+            .iter()
+            .find(|(_, segment)| segment == &&lookup_name)
+            .map(|(client_id, _)| client_id.clone())
+    };
+
+    let client_id = match client_id {
+        Some(id) => id,
+        None => {
+            error!(
+                "No client found for segment {} in {:?}",
+                file_name,
+                state.lock().await.client_segments
+            );
+            return (StatusCode::BAD_REQUEST, "No client found for segment").into_response();
+        }
+    };
 
     // Save the file
     let mut file = match File::create(&file_path).await {
@@ -56,7 +89,7 @@ pub async fn upload_handler(
         }
     };
 
-    // Write the data
+    // Write and verify the data
     if let Err(e) = file.write_all(&body).await {
         error!("Failed to write file: {}", e);
         let _ = tokio::fs::remove_file(&file_path).await;
@@ -67,7 +100,6 @@ pub async fn upload_handler(
             .into_response();
     }
 
-    // Ensure data is written to disk
     if let Err(e) = file.sync_all().await {
         error!("Failed to sync file: {}", e);
         let _ = tokio::fs::remove_file(&file_path).await;
@@ -78,10 +110,7 @@ pub async fn upload_handler(
             .into_response();
     }
 
-    // Wait a moment to ensure the file is fully written
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
-    // Verify the file was written correctly
+    // Verify file size and integrity
     match tokio::fs::metadata(&file_path).await {
         Ok(metadata) => {
             if metadata.len() == 0 {
@@ -114,24 +143,17 @@ pub async fn upload_handler(
                 .into_response();
         }
     }
-
-    // Associate segment with client
+    let segment_data = SegmentData {
+        data: body.to_vec(),
+        format: lookup_name.clone(),
+        segment_id: lookup_name.clone(),
+    };
+    // Register the segment with client using the original (non-encoded) name
     let mut state = state.lock().await;
-    let matching_client = state
-        .client_segments
-        .iter()
-        .find(|(_, segment)| segment == &&file_name)
-        .map(|(client_id, _)| client_id.clone());
+    state
+        .segment_manager
+        .add_processed_segment(client_id.clone(), segment_data);
+    info!("Successfully registered segment for client {}", client_id);
 
-    if let Some(client_id) = matching_client {
-        state
-            .segment_manager
-            .add_segment(client_id.clone(), file_name.clone());
-        info!("Successfully registered segment for client {}", client_id);
-        (StatusCode::OK, "Upload complete").into_response()
-    } else {
-        error!("No client found for segment {}", file_name);
-        let _ = tokio::fs::remove_file(&file_path).await;
-        (StatusCode::BAD_REQUEST, "No client found for segment").into_response()
-    }
+    (StatusCode::OK, "Upload complete").into_response()
 }

@@ -1,15 +1,27 @@
-use anyhow::{Context, Result};
+// ffmpeg-cluster-server/src/services/segment_manager.rs
+
+use anyhow::Result;
+use bytes::Bytes;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
+#[derive(Debug)]
+pub struct SegmentData {
+    pub data: Vec<u8>,
+    pub format: String,
+    pub segment_id: String,
+}
+
 pub struct SegmentManager {
-    segments: HashMap<String, String>,
+    segments: HashMap<String, SegmentData>,
     job_id: String,
     base_dir: PathBuf,
     work_dir: PathBuf,
+    original_format: Option<String>,
 }
 
 impl SegmentManager {
@@ -23,25 +35,22 @@ impl SegmentManager {
             job_id,
             base_dir,
             work_dir,
+            original_format: None,
         }
     }
 
     pub async fn init(&self) -> Result<()> {
-        // Create base server directory if it doesn't exist
         if !self.base_dir.exists() {
             tokio::fs::create_dir_all(&self.base_dir).await?;
             info!("Created server base directory: {}", self.base_dir.display());
         }
 
-        // Create job-specific directory
         if !self.work_dir.exists() {
             tokio::fs::create_dir_all(&self.work_dir).await?;
             info!("Created job directory: {}", self.work_dir.display());
         }
 
-        // Clean up old jobs
         self.cleanup_old_jobs().await?;
-
         Ok(())
     }
 
@@ -53,12 +62,332 @@ impl SegmentManager {
         &self.work_dir
     }
 
-    pub fn has_segment(&self, client_id: &str) -> bool {
-        self.segments.contains_key(client_id)
+    pub async fn detect_format(input_file: &str) -> Result<String> {
+        let format_output = Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "format=format_name",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                input_file,
+            ])
+            .output()
+            .await?;
+
+        let format = String::from_utf8_lossy(&format_output.stdout)
+            .trim()
+            .to_string();
+
+        info!("Detected input format: {}", format);
+        Ok(format)
     }
 
-    pub fn get_segment_path(&self, client_id: &str) -> Option<&str> {
-        self.segments.get(client_id).map(|s| s.as_str())
+    pub fn get_output_format(input_format: &str) -> (&'static str, Vec<&'static str>) {
+        // Split by comma and take first format
+        let format = input_format.split(',').next().unwrap_or("").trim();
+
+        match format {
+            f if f.contains("mov")
+                || f.contains("mp4")
+                || f.contains("m4a")
+                || f.contains("3gp")
+                || f.contains("mj2") =>
+            {
+                ("mp4", vec!["-f", "mp4", "-movflags", "+faststart"])
+            }
+            f if f.contains("matroska") || f.contains("webm") => ("mkv", vec!["-f", "matroska"]),
+            f if f.contains("avi") => ("avi", vec!["-f", "avi"]),
+            _ => {
+                // Default to MP4 as it's widely compatible
+                ("mp4", vec!["-f", "mp4", "-movflags", "+faststart"])
+            }
+        }
+    }
+
+    pub async fn create_benchmark_sample(
+        &self,
+        input_file: &str,
+        duration: u32,
+    ) -> Result<SegmentData> {
+        let format = Self::detect_format(input_file).await?;
+        let (ext, format_opts) = Self::get_output_format(&format);
+
+        let sample_id = format!("benchmark_{}", Uuid::new_v4());
+        let temp_path = self.work_dir.join(format!("{}.{}", sample_id, ext));
+
+        // Create owned strings for all arguments
+        let duration_str = duration.to_string();
+        let mut args = vec![
+            "-y".to_string(),
+            "-i".to_string(),
+            input_file.to_string(),
+            "-t".to_string(),
+            duration_str,
+            "-c".to_string(),
+            "copy".to_string(),
+        ];
+
+        // Convert format options to owned strings
+        let format_opts: Vec<String> = format_opts.iter().map(|&s| s.to_string()).collect();
+        args.extend(format_opts);
+
+        // Add the temp path
+        args.push(temp_path.to_str().unwrap().to_string());
+
+        let output = Command::new("ffmpeg").args(&args).output().await?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("Failed to create benchmark sample: {}", stderr);
+        }
+
+        let data = tokio::fs::read(&temp_path).await?;
+
+        // Clean up temporary file
+        if let Err(e) = tokio::fs::remove_file(&temp_path).await {
+            warn!("Failed to remove temporary benchmark file: {}", e);
+        }
+
+        Ok(SegmentData {
+            data,
+            format: ext.to_string(), // Send the actual extension instead of the raw format
+            segment_id: sample_id,
+        })
+    }
+    pub async fn create_segment(
+        &self,
+        input_file: &str,
+        start_frame: u64,
+        end_frame: u64,
+    ) -> Result<SegmentData> {
+        // Detect or use cached format
+        let format = if let Some(fmt) = &self.original_format {
+            fmt.clone()
+        } else {
+            let fmt = Self::detect_format(input_file).await?;
+            fmt
+        };
+
+        // Get proper extension
+        let (ext, format_opts) = Self::get_output_format(&format);
+
+        // Get video framerate for timestamp calculation
+        let fps_output = Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=r_frame_rate",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                input_file,
+            ])
+            .output()
+            .await?;
+
+        let fps_str = String::from_utf8_lossy(&fps_output.stdout);
+        let fps: f64 = {
+            let parts: Vec<f64> = fps_str
+                .trim()
+                .split('/')
+                .map(|x| x.parse::<f64>().unwrap_or(0.0))
+                .collect();
+            if parts.len() == 2 && parts[1] != 0.0 {
+                parts[0] / parts[1]
+            } else {
+                30.0 // fallback
+            }
+        };
+
+        // Convert frame numbers to timestamps
+        let start_time = start_frame as f64 / fps;
+        let duration = (end_frame - start_frame) as f64 / fps;
+
+        let segment_id = format!("segment_{}_{}", start_frame, Uuid::new_v4());
+        let temp_path = self.work_dir.join(format!("{}.{}", segment_id, ext));
+
+        // Create owned strings for timestamps
+        let start_time_str = start_time.to_string();
+        let duration_str = duration.to_string();
+
+        // Create base arguments vector
+        let mut args = vec![
+            "-y".to_string(),
+            "-ss".to_string(),
+            start_time_str,
+            "-t".to_string(),
+            duration_str,
+            "-i".to_string(),
+            input_file.to_string(),
+            "-c".to_string(),
+            "copy".to_string(),
+            "-avoid_negative_ts".to_string(),
+            "1".to_string(),
+            "-map".to_string(),
+            "0".to_string(),
+        ];
+
+        // Convert format options to owned strings and extend args
+        let format_opts: Vec<String> = format_opts.iter().map(|&s| s.to_string()).collect();
+        args.extend(format_opts);
+        args.push(temp_path.to_str().unwrap().to_string());
+
+        info!("Creating segment with args: {:?}", args);
+
+        let output = Command::new("ffmpeg").args(&args).output().await?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("Failed to create segment: {}", stderr);
+        }
+
+        let data = tokio::fs::read(&temp_path).await?;
+
+        // Clean up temporary file
+        if let Err(e) = tokio::fs::remove_file(&temp_path).await {
+            warn!("Failed to remove temporary segment file: {}", e);
+        }
+
+        Ok(SegmentData {
+            data,
+            format: ext.to_string(), // Send the extension instead of raw format
+            segment_id,
+        })
+    }
+    pub fn add_processed_segment(&mut self, client_id: String, segment_data: SegmentData) {
+        info!(
+            "Adding processed segment for client {} in job {}: {}",
+            client_id, self.job_id, segment_data.segment_id
+        );
+        self.segments.insert(client_id, segment_data);
+    }
+
+    pub async fn verify_segment(&self, segment_data: &[u8], temp_dir: &Path) -> Result<u64> {
+        let temp_path = temp_dir.join(format!("verify_{}.tmp", Uuid::new_v4()));
+        tokio::fs::write(&temp_path, segment_data).await?;
+
+        let frame_count = Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-count_packets",
+                "-show_entries",
+                "stream=nb_read_packets",
+                "-of",
+                "csv=p=0",
+                temp_path.to_str().unwrap(),
+            ])
+            .output()
+            .await?;
+
+        if !frame_count.status.success() {
+            anyhow::bail!("Failed to verify segment frame count");
+        }
+
+        let count = String::from_utf8(frame_count.stdout)?
+            .trim()
+            .parse::<u64>()?;
+
+        // Clean up temporary file
+        if let Err(e) = tokio::fs::remove_file(&temp_path).await {
+            warn!("Failed to remove temporary verify file: {}", e);
+        }
+
+        Ok(count)
+    }
+
+    pub async fn combine_segments(&self, output_file: &str) -> Result<()> {
+        info!("Combining segments into {}", output_file);
+
+        // Sort segments by frame number
+        let mut segments: Vec<_> = self.segments.values().collect();
+        segments.sort_by(|a, b| {
+            let get_frame_num = |s: &str| {
+                s.split('_')
+                    .nth(1)
+                    .and_then(|n| n.parse::<u64>().ok())
+                    .unwrap_or(0)
+            };
+            get_frame_num(&a.segment_id).cmp(&get_frame_num(&b.segment_id))
+        });
+
+        if segments.is_empty() {
+            anyhow::bail!("No segments to combine");
+        }
+
+        let temp_dir = tempfile::tempdir()?;
+        let (ext, format_opts) = Self::get_output_format(&segments[0].format);
+
+        // Create temporary files for segments
+        let mut segment_paths = Vec::new();
+        for (i, segment) in segments.iter().enumerate() {
+            let temp_path = temp_dir.path().join(format!("segment_{}.{}", i, ext));
+            tokio::fs::write(&temp_path, &segment.data).await?;
+            segment_paths.push(temp_path);
+        }
+
+        // Create concat file
+        let concat_file = temp_dir.path().join("concat.txt");
+        let concat_content = segment_paths
+            .iter()
+            .map(|path| format!("file '{}'\n", path.display()))
+            .collect::<String>();
+
+        tokio::fs::write(&concat_file, concat_content).await?;
+
+        // Combine segments
+        let mut args = vec![
+            "-y",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            concat_file.to_str().unwrap(),
+            "-c",
+            "copy",
+        ];
+        args.extend(format_opts.iter());
+        args.push(output_file);
+
+        let output = Command::new("ffmpeg").args(&args).output().await?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("Failed to combine segments: {}", stderr);
+        }
+
+        // Verify final output
+        let verify_output = Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                output_file,
+            ])
+            .output()
+            .await?;
+
+        if verify_output.status.success() {
+            let duration = String::from_utf8_lossy(&verify_output.stdout)
+                .trim()
+                .parse::<f64>()
+                .unwrap_or(0.0);
+            info!("Final output duration: {:.2} seconds", duration);
+        }
+
+        Ok(())
     }
 
     async fn cleanup_old_jobs(&self) -> Result<()> {
@@ -79,268 +408,39 @@ impl SegmentManager {
         Ok(())
     }
 
-    pub fn add_segment(&mut self, client_id: String, segment_path: String) {
-        let relative_path = self.work_dir.join(&segment_path);
-        info!(
-            "Adding segment for client {} in job {}: {}",
-            client_id,
-            self.job_id,
-            relative_path.display()
-        );
-        self.segments
-            .insert(client_id, relative_path.to_str().unwrap().to_string());
-    }
-
-    pub fn get_segment_count(&self) -> usize {
-        self.segments.len()
-    }
-
-    pub async fn verify_segment(
-        &self,
-        segment_path: &str,
-        expected_frames: Option<u64>,
-    ) -> Result<u64> {
-        let frame_count = Command::new("ffprobe")
-            .args([
-                "-v",
-                "error",
-                "-select_streams",
-                "v:0",
-                "-count_packets",
-                "-show_entries",
-                "stream=nb_read_packets",
-                "-of",
-                "csv=p=0",
-                segment_path,
-            ])
-            .output()
-            .await?;
-
-        if !frame_count.status.success() {
-            anyhow::bail!("Failed to verify segment frame count");
-        }
-
-        let count = String::from_utf8(frame_count.stdout)?
-            .trim()
-            .parse::<u64>()?;
-
-        if let Some(expected) = expected_frames {
-            if count < expected {
-                error!(
-                    "Frame count mismatch in segment {}: got {} but expected {}",
-                    segment_path, count, expected
-                );
-                anyhow::bail!("Segment has fewer frames than expected");
-            }
-        }
-
-        Ok(count)
-    }
-
-    pub async fn combine_segments(&self, output_file: &str, audio_file: &str) -> Result<()> {
-        info!("Combining segments into {}", output_file);
-
-        // Sort segments by frame number
-        let mut segments: Vec<_> = self.segments.values().collect();
-        segments.sort_by_key(|path| {
-            Path::new(path)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .and_then(|n| n.split('_').last())
-                .and_then(|n| n.strip_suffix(".mp4"))
-                .and_then(|n| n.parse::<u64>().ok())
-                .unwrap_or(0)
-        });
-
-        // Create temporary directory
-        let temp_dir = self.work_dir.join("temp");
-        tokio::fs::create_dir_all(&temp_dir).await?;
-
-        // First pass: Verify and fix segments
-        let mut fixed_segments = Vec::new();
-        let mut total_frames = 0;
-
-        for (i, segment) in segments.iter().enumerate() {
-            let fixed_segment = temp_dir.join(format!("fixed_{}.mp4", i));
-
-            // Verify original segment frame count
-            let frame_count = self.verify_segment(segment, None).await?;
-            info!("Original segment {} has {} frames", segment, frame_count);
-
-            // Fix segment
-            let fix_args = vec![
-                "-y",
-                "-i",
-                segment,
-                "-c:v",
-                "copy",
-                "-vsync",
-                "1",
-                "-video_track_timescale",
-                "30000",
-                fixed_segment.to_str().unwrap(),
-            ];
-
-            let fix_output = Command::new("ffmpeg")
-                .args(&fix_args)
-                .output()
-                .await
-                .context("Failed to fix segment")?;
-
-            if !fix_output.status.success() {
-                let stderr = String::from_utf8_lossy(&fix_output.stderr);
-                error!("Segment fix failed: {}", stderr);
-                anyhow::bail!("Segment fix failed: {}", stderr);
-            }
-
-            // Verify fixed segment
-            let fixed_count = self
-                .verify_segment(&fixed_segment.to_str().unwrap(), Some(frame_count))
-                .await?;
-            info!("Fixed segment has {} frames", fixed_count);
-
-            total_frames += fixed_count;
-            fixed_segments.push(fixed_segment.to_str().unwrap().to_string());
-        }
-
-        // Write concat file
-        let concat_file = temp_dir.join("concat.txt");
-        let mut concat_content = String::new();
-
-        for segment in &fixed_segments {
-            let abs_path = Path::new(segment).canonicalize()?;
-            concat_content.push_str(&format!("file '{}'\n", abs_path.to_str().unwrap()));
-            info!("Adding segment to concat: {}", segment);
-        }
-
-        tokio::fs::write(&concat_file, concat_content).await?;
-
-        // Combine video segments
-        let temp_video = temp_dir.join("temp_video_combined.mp4");
-        let video_args = vec![
-            "-y",
-            "-f",
-            "concat",
-            "-safe",
-            "0",
-            "-i",
-            concat_file.to_str().unwrap(),
-            "-c",
-            "copy",
-            "-vsync",
-            "1",
-            "-video_track_timescale",
-            "30000",
-            temp_video.to_str().unwrap(),
-        ];
-
-        info!(
-            "Running video combination command: ffmpeg {}",
-            video_args.join(" ")
-        );
-
-        let video_output = Command::new("ffmpeg")
-            .args(&video_args)
-            .output()
-            .await
-            .context("Failed to execute FFmpeg for video combination")?;
-
-        if !video_output.status.success() {
-            let stderr = String::from_utf8_lossy(&video_output.stderr);
-            error!("FFmpeg video combination error: {}", stderr);
-            anyhow::bail!("FFmpeg video combination failed: {}", stderr);
-        }
-
-        // Verify combined video has all frames
-        let combined_frames = self
-            .verify_segment(temp_video.to_str().unwrap(), Some(total_frames))
-            .await?;
-        info!(
-            "Combined video has {} frames (expected {})",
-            combined_frames, total_frames
-        );
-
-        // Add audio with precise synchronization
-        let audio_args = vec![
-            "-y",
-            "-i",
-            temp_video.to_str().unwrap(),
-            "-i",
-            audio_file,
-            "-c:v",
-            "copy",
-            "-c:a",
-            "aac",
-            "-strict",
-            "experimental",
-            "-map",
-            "0:v:0",
-            "-map",
-            "1:a:0",
-            "-vsync",
-            "1",
-            "-video_track_timescale",
-            "30000",
-            output_file,
-        ];
-
-        info!(
-            "Running audio combination command: ffmpeg {}",
-            audio_args.join(" ")
-        );
-
-        let audio_output = Command::new("ffmpeg")
-            .args(&audio_args)
-            .output()
-            .await
-            .context("Failed to execute FFmpeg for audio combination")?;
-
-        if !audio_output.status.success() {
-            let stderr = String::from_utf8_lossy(&audio_output.stderr);
-            error!("FFmpeg audio combination error: {}", stderr);
-            anyhow::bail!("FFmpeg audio combination failed: {}", stderr);
-        }
-
-        // Final verification
-        info!("Verifying final output file");
-        let final_frames = self.verify_segment(output_file, Some(total_frames)).await?;
-        info!("Final output has {} frames", final_frames);
-
-        // Cleanup
-        if let Err(e) = tokio::fs::remove_dir_all(&temp_dir).await {
-            warn!("Failed to clean up temporary directory: {}", e);
-        }
-
-        Ok(())
-    }
-
     pub async fn cleanup(&self) -> Result<()> {
         info!("Cleaning up job directory: {}", self.work_dir.display());
 
         if self.work_dir.exists() {
-            // Wait for any pending operations
             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
             match tokio::fs::remove_dir_all(&self.work_dir).await {
                 Ok(_) => {
                     info!("Successfully removed job directory");
                 }
                 Err(e) => {
                     warn!("Failed to remove job directory on first attempt: {}", e);
-                    // Second attempt after a longer delay
                     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                    match tokio::fs::remove_dir_all(&self.work_dir).await {
-                        Ok(_) => {
-                            info!("Successfully removed job directory on second attempt");
-                        }
-                        Err(e) => {
-                            error!("Failed to remove job directory on second attempt: {}", e);
-                            return Err(e.into());
-                        }
+                    if let Err(e) = tokio::fs::remove_dir_all(&self.work_dir).await {
+                        error!("Failed to remove job directory on second attempt: {}", e);
+                        return Err(e.into());
                     }
+                    info!("Successfully removed job directory on second attempt");
                 }
             }
         }
+        Ok(())
+    }
+
+    pub fn get_segment_count(&self) -> usize {
+        self.segments.len()
+    }
+
+    pub fn has_segment(&self, client_id: &str) -> bool {
+        self.segments.contains_key(client_id)
+    }
+
+    pub async fn stream_segment(data: &[u8], mut writer: impl std::io::Write) -> Result<()> {
+        writer.write_all(data)?;
         Ok(())
     }
 }
