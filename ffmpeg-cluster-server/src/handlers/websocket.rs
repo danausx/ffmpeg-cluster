@@ -549,7 +549,7 @@ async fn handle_broadcast_message(
     sender: &mut SplitSink<WebSocket, Message>,
     state_arc: &Arc<Mutex<AppState>>,
 ) -> Result<(), anyhow::Error> {
-    let mut state = state_arc.lock().await;
+    let state = state_arc.lock().await;
 
     match &broadcast_msg {
         ServerMessage::BenchmarkRequest { .. } => {

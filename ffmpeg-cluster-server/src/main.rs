@@ -1,11 +1,10 @@
 use axum::{
     extract::DefaultBodyLimit,
-    routing::{get, post},
+    routing::get,
     Router,
 };
 use clap::Parser;
-use ffmpeg_cluster_common::models::{config::ServerConfig, messages::JobConfig};
-use services::ffmpeg::FfmpegService;
+use ffmpeg_cluster_common::models::config::ServerConfig;
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 use tokio::sync::{broadcast, Mutex};
 use tower_http::{cors::CorsLayer, services::ServeDir};

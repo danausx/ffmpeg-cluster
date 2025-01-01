@@ -6,7 +6,6 @@ use axum::{
     },
     response::Response,
 };
-use bytes::Bytes;
 use ffmpeg_cluster_common::models::messages::{
     ClientInfo, ClientStatus, JobConfig, JobStatus, ServerCommand, ServerMessage, ServerResponse,
     VideoData,
@@ -146,7 +145,7 @@ async fn handle_process_local_file(
     };
 
     // First, send a new job notification to all connected clients
-    let mut state = state.lock().await;
+    let state = state.lock().await;
     if let Some(job) = state.job_queue.get_job(&job_id) {
         let msg = ServerMessage::ClientId {
             id: "broadcast".to_string(),

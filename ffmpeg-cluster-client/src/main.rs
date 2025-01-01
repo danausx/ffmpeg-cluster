@@ -1,11 +1,10 @@
-use bytes::{Bytes, BytesMut};
 use clap::Parser;
 use ffmpeg_cluster_common::models::messages::{ClientMessage, ServerMessage};
 use futures_util::{stream::SplitSink, SinkExt, StreamExt};
 use std::time::Duration;
-use tokio::{net::TcpStream, sync::mpsc};
+use tokio::net::TcpStream;
 use tokio_tungstenite::{
-    connect_async, connect_async_with_config,
+    connect_async_with_config,
     tungstenite::protocol::{Message, WebSocketConfig},
     MaybeTlsStream, WebSocketStream,
 };
