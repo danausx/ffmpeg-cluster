@@ -101,5 +101,6 @@ flake.lock
 *.mp4
 work/
 uploads/
-output/
+release/
 Cargo.lock
+.github/dependabot.yml

@@ -32,47 +32,47 @@ download_ffmpeg() {
     local arch=$2
     print_color "BLUE" "Downloading FFmpeg for $os..."
     
-    mkdir -p build/bin
+    mkdir -p build/ffmpeg-cluster-client/bin
 
     case "$os" in
         "macos-x86_64"|"macos-aarch64")
             curl -L "https://evermeet.cx/ffmpeg/getrelease/ffmpeg/zip" -o ffmpeg.zip
             curl -L "https://evermeet.cx/ffmpeg/getrelease/ffprobe/zip" -o ffprobe.zip
             
-            unzip ffmpeg.zip -d build/bin/
-            unzip ffprobe.zip -d build/bin/
-            chmod +x build/bin/ffmpeg
-            chmod +x build/bin/ffprobe
+            unzip ffmpeg.zip -d build/ffmpeg-cluster-client/bin/
+            unzip ffprobe.zip -d build/ffmpeg-cluster-client/bin/
+            chmod +x build/ffmpeg-cluster-client/bin/ffmpeg
+            chmod +x build/ffmpeg-cluster-client/bin/ffprobe
             rm ffmpeg.zip ffprobe.zip
             ;;
 
         "linux-x86_64")
             curl -L "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz" -o ffmpeg.tar.xz
             tar xf ffmpeg.tar.xz
-            mv ffmpeg-*-amd64-static/ffmpeg build/bin/
-            mv ffmpeg-*-amd64-static/ffprobe build/bin/
+            mv ffmpeg-*-amd64-static/ffmpeg build/ffmpeg-cluster-client/bin/
+            mv ffmpeg-*-amd64-static/ffprobe build/ffmpeg-cluster-client/bin/
             rm -rf ffmpeg-*-amd64-static
             rm ffmpeg.tar.xz
-            chmod +x build/bin/ffmpeg
-            chmod +x build/bin/ffprobe
+            chmod +x build/ffmpeg-cluster-client/bin/ffmpeg
+            chmod +x build/ffmpeg-cluster-client/bin/ffprobe
             ;;
 
         "linux-aarch64")
             curl -L "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-arm64-static.tar.xz" -o ffmpeg.tar.xz
             tar xf ffmpeg.tar.xz
-            mv ffmpeg-*-arm64-static/ffmpeg build/bin/
-            mv ffmpeg-*-arm64-static/ffprobe build/bin/
+            mv ffmpeg-*-arm64-static/ffmpeg build/ffmpeg-cluster-client/bin/
+            mv ffmpeg-*-arm64-static/ffprobe build/ffmpeg-cluster-client/bin/
             rm -rf ffmpeg-*-arm64-static
             rm ffmpeg.tar.xz
-            chmod +x build/bin/ffmpeg
-            chmod +x build/bin/ffprobe
+            chmod +x build/ffmpeg-cluster-client/bin/ffmpeg
+            chmod +x build/ffmpeg-cluster-client/bin/ffprobe
             ;;
 
         "windows-x86_64")
             curl -L "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip" -o ffmpeg.zip
             unzip ffmpeg.zip
-            mv ffmpeg-master-latest-win64-gpl/bin/ffmpeg.exe build/bin/
-            mv ffmpeg-master-latest-win64-gpl/bin/ffprobe.exe build/bin/
+            mv ffmpeg-master-latest-win64-gpl/bin/ffmpeg.exe build/ffmpeg-cluster-client/bin/
+            mv ffmpeg-master-latest-win64-gpl/bin/ffprobe.exe build/ffmpeg-cluster-client/bin/
             rm -rf ffmpeg-master-latest-win64-gpl
             rm ffmpeg.zip
             ;;
@@ -141,7 +141,6 @@ esac
 
 # Clean old build and release files
 rm -rf build release
-mkdir -p build/bin
 
 # Install Rust target if needed
 check_and_install_target "$rust_target"
@@ -155,27 +154,27 @@ cargo build --release --target "$rust_target"
 
 # Copy the binary to build directory
 if [[ $target == windows* ]]; then
-    cp "target/$rust_target/release/ffmpeg-cluster-client.exe" build/bin/
+    cp "target/$rust_target/release/ffmpeg-cluster-client.exe" build/ffmpeg-cluster-client/
     binary_name="ffmpeg-cluster-client.exe"
 else
-    cp "target/$rust_target/release/ffmpeg-cluster-client" build/bin/
+    cp "target/$rust_target/release/ffmpeg-cluster-client" build/ffmpeg-cluster-client/
     binary_name="ffmpeg-cluster-client"
-    chmod +x "build/bin/$binary_name"
+    chmod +x "build/ffmpeg-cluster-client/$binary_name"
 fi
 
 # Verify all required files are present
-if [ ! -f "build/bin/$binary_name" ]; then
+if [ ! -f "build/ffmpeg-cluster-client/$binary_name" ]; then
     print_color "RED" "Error: Client binary not found!"
     exit 1
 fi
 
 if [[ $target == windows* ]]; then
-    if [ ! -f "build/bin/ffmpeg.exe" ] || [ ! -f "build/bin/ffprobe.exe" ]; then
+    if [ ! -f "build/ffmpeg-cluster-client/bin/ffmpeg.exe" ] || [ ! -f "build/ffmpeg-cluster-client/bin/ffprobe.exe" ]; then
         print_color "RED" "Error: FFmpeg binaries not found!"
         exit 1
     fi
 else
-    if [ ! -f "build/bin/ffmpeg" ] || [ ! -f "build/bin/ffprobe" ]; then
+    if [ ! -f "build/ffmpeg-cluster-client/bin/ffmpeg" ] || [ ! -f "build/ffmpeg-cluster-client/bin/ffprobe" ]; then
         print_color "RED" "Error: FFmpeg binaries not found!"
         exit 1
     fi
@@ -185,10 +184,10 @@ fi
 mkdir -p release
 if [[ $target == windows* ]]; then
     print_color "BLUE" "Creating Windows ZIP archive..."
-    cd build && zip -r "../release/ffmpeg-cluster-client-$target.zip" * && cd ..
+    cd build && zip -r "../release/ffmpeg-cluster-client-$target.zip" ffmpeg-cluster-client && cd ..
 else
     print_color "BLUE" "Creating tar.gz archive..."
-    cd build && tar czf "../release/ffmpeg-cluster-client-$target.tar.gz" * && cd ..
+    cd build && tar czf "../release/ffmpeg-cluster-client-$target.tar.gz" ffmpeg-cluster-client && cd ..
 fi
 
 print_color "GREEN" "Build complete!"
