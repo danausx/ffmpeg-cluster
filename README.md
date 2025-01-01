@@ -2,15 +2,20 @@
 
 ## Overview
 
-FFmpeg Cluster is a distributed video processing based in Rust and FFmpeg. It leverages multiple clients to process and encode video files in parallel. By splitting video processing across multiple machines, this project aims to significantly reduce encoding time and maximize computational resources on clustered encoding setups.
+FFmpeg Cluster is a distributed video processing system built in Rust that leverages hardware-accelerated FFmpeg encoding across multiple machines. It uses WebSocket communication for real-time coordination and supports automatic hardware detection for optimal performance.
 
 ## Key Features
 
-- **Distributed Processing**: Dynamically splits video processing across multiple clients
-- **Flexible Configuration**: Customizable FFmpeg encoding parameters
-- **Websocket-based Communication**: Real-time coordination between server and clients
-- **Automatic Segment Management**: Intelligent frame distribution and segment recombination
-- **Robust Error Handling**: Comprehensive error tracking and recovery
+- **Hardware-Accelerated Processing**: Supports multiple encoders:
+  - NVIDIA NVENC
+  - Intel QuickSync
+  - AMD AMF
+  - Apple VideoToolbox
+  - Intel/AMD VAAPI on Linux
+- **Intelligent Load Balancing**: Dynamic workload distribution based on client performance
+- **Frame-Accurate Processing**: Precise frame handling during splitting and recombination
+- **Automatic Recovery**: Built-in retry mechanisms and error handling
+- **Real-time Monitoring**: Live progress tracking and client status updates
 
 ## Architecture
 
@@ -35,86 +40,68 @@ The project is composed of three main Rust components:
 ## Prerequisites
 
 - Rust (latest stable version)
-- FFmpeg installed
-- Cargo package manager
+- FFmpeg (automatically managed by the client)
 
-## Installation
+## Configuration
 
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/yourusername/ffmpeg-cluster.git
-   cd ffmpeg-cluster
-   ```
+### Server Options
+- `--required-clients`: Number of clients needed (default: 3)
+- `--benchmark-duration`: Benchmark duration in seconds (default: 10)
+- `--ffmpeg-params`: FFmpeg encoding parameters
+- `--file-name-output`: Output filename
+- `--port`: Server port (default: 5001)
+- `--exactly`: Enable exact frame counting (default: true)
+- `--chunk-size`: Data chunk size in bytes (default: 1MB)
+- `--max-retries`: Maximum retry attempts (default: 3)
+- `--retry-delay`: Delay between retries in seconds (default: 5)
 
-2. Build the project:
-   ```bash
-   cargo build --release
-   ```
+### Client Options
+- `--server-ip`: Server address (default: localhost)
+- `--server-port`: Server port (default: 5001)
+- `--benchmark-duration`: Benchmark duration (default: 10)
+- `--reconnect-delay`: Reconnection delay in seconds (default: 3)
+- `--persistent`: Keep trying to reconnect (default: true)
 
-## Usage
+## Job States
 
-### Server
+Jobs progress through the following states:
+- Queued
+- WaitingForClients
+- Benchmarking
+- Processing
+- Combining
+- Completed
+- Failed
+- Cancelled
 
-Start the server with custom parameters:
-```bash
-cargo run --bin ffmpeg-cluster-server -- \
-  --file-name input.mp4 \
-  --required-clients 3 \
-  --port 5001
-```
+## Client States
 
-### Client
-
-Connect a client to the server:
-```bash
-cargo run --bin ffmpeg-cluster-client -- \
-  --server-ip localhost \
-  --server-port 5001
-```
-
-## Configuration Options
-
-### Server Configuration
-- `--required-clients`: Number of clients needed to start processing
-- `--file-name`: Input video file
-- `--file-name-output`: Output video file name
-- `--ffmpeg-params`: Custom FFmpeg encoding parameters
-
-### Client Configuration
-- `--server-ip`: Server IP address
-- `--server-port`: Server port
-- `--benchmark-duration`: Benchmark processing duration
-
-## Example Workflow
-
-1. Start the server with an input video
-2. Launch multiple clients
-3. Clients connect and perform benchmarks
-4. Video is split and processed in parallel
-5. Segments are recombined into final output
+Clients can be in the following states:
+- Connected
+- Benchmarking
+- Processing
+- Idle
+- Disconnected
 
 ## Performance Considerations
 
 - Processing speed depends on:
-  - Number of clients
+  - Available hardware acceleration
+  - Network bandwidth
+  - Input video characteristics
+  - Number of connected clients
   - Client hardware capabilities
-  - Video characteristics
-  - Encoding parameters
 
-## Roadmap
+## Error Handling
 
-- [ ] Add more extensive logging
-- [ ] Implement advanced error recovery
-- [ ] Support for more video processing scenarios
-- [ ] Job handling and resume features
-- [ ] Enhanced client load balancing
-- [ ] Comprehensive web UI
-- [ ] Live streams compatibility
-- [ ] Jellyfin compatibility
+The system includes comprehensive error handling for:
+- Network disconnections
+- Processing failures
+- Frame count mismatches
+- Hardware acceleration issues
+- Corrupt video segments
 
 ## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
 
 1. Fork the repository
 2. Create your feature branch (`git checkout -b feature/AmazingFeature`)
