@@ -275,7 +275,23 @@ async fn process_benchmark_data(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_target(false)
+        .with_thread_ids(false)
+        .with_file(false)
+        .with_line_number(false)
+        .with_thread_names(false)
+        .with_level(true)
+        .with_ansi(true)
+        .with_timer(tracing_subscriber::fmt::time::LocalTime::rfc_3339())
+        .event_format(
+            tracing_subscriber::fmt::format()
+                .with_level(true)
+                .with_target(false)
+                .compact(),
+        )
+        .init();
     let args = Args::parse();
 
     info!("FFmpeg Cluster Client starting...");
