@@ -229,8 +229,8 @@ download_ffmpeg() {
             
             unzip -o ffmpeg.zip
             unzip -o ffprobe.zip
-            mv ffmpeg "$ffmpeg_cache_dir/"
-            mv ffprobe "$ffmpeg_cache_dir/"
+            cp ffmpeg "$ffmpeg_cache_dir/"
+            cp ffprobe "$ffmpeg_cache_dir/"
             cp "$ffmpeg_cache_dir/ffmpeg" "$client_bin_dir/"
             cp "$ffmpeg_cache_dir/ffprobe" "$client_bin_dir/"
             chmod +x "$client_bin_dir/ffmpeg"
@@ -241,50 +241,42 @@ download_ffmpeg() {
         "linux-x86_64")
             curl -L "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz" -o ffmpeg.tar.xz
             tar xf ffmpeg.tar.xz
-            # Get the actual directory name created by tar
             ffmpeg_dir=$(find . -maxdepth 1 -type d -name "ffmpeg-*-amd64-static" | head -n 1)
             if [ -z "$ffmpeg_dir" ]; then
                 print_color "RED" "Failed to find extracted FFmpeg directory"
                 exit 1
             fi
-            
-            # Create directories first
-            mkdir -p "$ffmpeg_cache_dir"
-            mkdir -p "$client_bin_dir"
-            
-            # Copy files
             cp "$ffmpeg_dir/ffmpeg" "$ffmpeg_cache_dir/"
             cp "$ffmpeg_dir/ffprobe" "$ffmpeg_cache_dir/"
             cp "$ffmpeg_cache_dir/ffmpeg" "$client_bin_dir/"
             cp "$ffmpeg_cache_dir/ffprobe" "$client_bin_dir/"
-            
-            # Set permissions
             chmod +x "$client_bin_dir/ffmpeg"
             chmod +x "$client_bin_dir/ffprobe"
-            
-            # Cleanup
             rm -rf "$ffmpeg_dir" ffmpeg.tar.xz
             ;;
 
         "linux-aarch64")
             curl -L "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-arm64-static.tar.xz" -o ffmpeg.tar.xz
             tar xf ffmpeg.tar.xz
-            mv ffmpeg-*-arm64-static/ffmpeg "$ffmpeg_cache_dir/"
-            mv ffmpeg-*-arm64-static/ffprobe "$ffmpeg_cache_dir/"
+            ffmpeg_dir=$(find . -maxdepth 1 -type d -name "ffmpeg-*-arm64-static" | head -n 1)
+            if [ -z "$ffmpeg_dir" ]; then
+                print_color "RED" "Failed to find extracted FFmpeg directory"
+                exit 1
+            fi
+            cp "$ffmpeg_dir/ffmpeg" "$ffmpeg_cache_dir/"
+            cp "$ffmpeg_dir/ffprobe" "$ffmpeg_cache_dir/"
             cp "$ffmpeg_cache_dir/ffmpeg" "$client_bin_dir/"
             cp "$ffmpeg_cache_dir/ffprobe" "$client_bin_dir/"
-            rm -rf ffmpeg-*-arm64-static ffmpeg.tar.xz
             chmod +x "$client_bin_dir/ffmpeg"
             chmod +x "$client_bin_dir/ffprobe"
+            rm -rf "$ffmpeg_dir" ffmpeg.tar.xz
             ;;
 
         "windows-x86_64")
             curl -L "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip" -o ffmpeg.zip
             unzip -o ffmpeg.zip
-            # Create directory first and then move files
-            mkdir -p "$ffmpeg_cache_dir"
-            mv "ffmpeg-master-latest-win64-gpl/bin/ffmpeg.exe" "$ffmpeg_cache_dir/"
-            mv "ffmpeg-master-latest-win64-gpl/bin/ffprobe.exe" "$ffmpeg_cache_dir/"
+            cp "ffmpeg-master-latest-win64-gpl/bin/ffmpeg.exe" "$ffmpeg_cache_dir/"
+            cp "ffmpeg-master-latest-win64-gpl/bin/ffprobe.exe" "$ffmpeg_cache_dir/"
             cp "$ffmpeg_cache_dir/ffmpeg.exe" "$client_bin_dir/"
             cp "$ffmpeg_cache_dir/ffprobe.exe" "$client_bin_dir/"
             rm -rf ffmpeg-master-latest-win64-gpl ffmpeg.zip
