@@ -185,9 +185,10 @@ setup_build_dirs() {
 # Function to download and extract FFmpeg if not already present
 download_ffmpeg() {
     local os=$1
-    local ffmpeg_cache_dir="$CACHE_DIR/ffmpeg/$os"
-    local temp_dir="$TEMP_DIR/$os"
-    local client_bin_dir="$BUILD_DIR/client/bin"
+    # Convert to absolute paths
+    local ffmpeg_cache_dir="$(pwd)/$CACHE_DIR/ffmpeg/$os"
+    local temp_dir="$(pwd)/$TEMP_DIR/$os"
+    local client_bin_dir="$(pwd)/$BUILD_DIR/client/bin"
     
     # Create all necessary directories first
     mkdir -p "$ffmpeg_cache_dir"
@@ -263,8 +264,8 @@ download_ffmpeg() {
                 print_color "RED" "Failed to find extracted FFmpeg directory"
                 exit 1
             fi
-            cp "$ffmpeg_dir/ffmpeg" "$ffmpeg_cache_dir/"
-            cp "$ffmpeg_dir/ffprobe" "$ffmpeg_cache_dir/"
+            cp "$temp_dir/$ffmpeg_dir/ffmpeg" "$ffmpeg_cache_dir/"
+            cp "$temp_dir/$ffmpeg_dir/ffprobe" "$ffmpeg_cache_dir/"
             cp "$ffmpeg_cache_dir/ffmpeg" "$client_bin_dir/"
             cp "$ffmpeg_cache_dir/ffprobe" "$client_bin_dir/"
             chmod +x "$client_bin_dir/ffmpeg"
