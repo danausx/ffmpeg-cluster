@@ -171,6 +171,26 @@ case $component_choice in
         ;;
 esac
 
+# Get native platform for menu display
+native_platform_display=""
+case "$NATIVE_TARGET" in
+    "macos-x86_64")
+        native_platform_display="macOS (x86_64)"
+        ;;
+    "macos-aarch64")
+        native_platform_display="macOS (ARM64)"
+        ;;
+    "linux-x86_64")
+        native_platform_display="Linux (x86_64)"
+        ;;
+    "linux-aarch64")
+        native_platform_display="Linux (ARM64)"
+        ;;
+    "windows-x86_64")
+        native_platform_display="Windows (x86_64)"
+        ;;
+esac
+
 # Platform selection menu
 print_menu_header "Platform Selection"
 print_menu_option "1" "macOS (Universal)"
@@ -179,7 +199,7 @@ print_menu_option "3" "macOS (ARM64)"
 print_menu_option "4" "Linux (x86_64)"
 print_menu_option "5" "Linux (ARM64)"
 print_menu_option "6" "Windows (x86_64)"
-print_menu_option "7" "$NATIVE_TARGET [default]"
+print_menu_option "7" "$native_platform_display [default]"
 print_menu_option "8" "Quit"
 printf "\nEnter your choice (1-8) [7]: "
 read -r platform_choice
@@ -224,13 +244,9 @@ case $platform_choice in
         exit 0
         ;;
     *)
-    target="$NATIVE_TARGET"
-    rust_target="$NATIVE_RUST_TARGET"
-    if [[ "$target" == linux* ]]; then
-        check_docker
-        check_cross
-    fi
-    ;;
+        target="$NATIVE_TARGET"
+        rust_target="$NATIVE_RUST_TARGET"
+        ;;
 esac
 
 # Main directories
