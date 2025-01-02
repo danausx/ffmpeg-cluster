@@ -30,6 +30,9 @@ struct Args {
 
     #[arg(long, default_value = "true")]
     persistent: bool,
+
+    #[arg(long)]
+    upload_file: Option<String>,
 }
 
 struct ClientState {
@@ -272,6 +275,47 @@ async fn process_benchmark_data(
     Ok(())
 }
 
+async fn upload_file(
+    file_path: &str,
+    ws_stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (mut write, mut read) = StreamExt::split(ws_stream);
+
+    // Read the file
+    let data = tokio::fs::read(file_path).await?;
+    let file_name = std::path::Path::new(file_path)
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+
+    // Create upload message
+    let message = ClientMessage::UploadAndProcessFile {
+        file_name,
+        data,
+        config: None,
+    };
+
+    // Send the message
+    write
+        .send(Message::Text(serde_json::to_string(&message)?.into()))
+        .await?;
+
+    // Wait for response
+    while let Some(msg) = read.next().await {
+        match msg? {
+            Message::Text(text) => {
+                println!("Server response: {}", text);
+                break;
+            }
+            Message::Close(_) => break,
+            _ => continue,
+        }
+    }
+
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
@@ -297,6 +341,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Connecting to {}:{}", args.server_ip, args.server_port);
 
     let mut state = ClientState::new();
+
+    if let Some(file_path) = &args.upload_file {
+        match connect_to_server(&args).await {
+            Ok(ws_stream) => {
+                info!("Connected to server, uploading file...");
+                if let Err(e) = upload_file(file_path, ws_stream).await {
+                    error!("Failed to upload file: {}", e);
+                }
+                return Ok(());
+            }
+            Err(e) => {
+                error!("Failed to connect: {}", e);
+                return Err(e);
+            }
+        }
+    }
 
     loop {
         match connect_to_server(&args).await {

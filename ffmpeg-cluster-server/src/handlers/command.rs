@@ -66,6 +66,11 @@ async fn handle_command_socket(
                     ServerCommand::DisconnectClient { client_id } => {
                         handle_disconnect_client(client_id, &state).await
                     }
+                    ServerCommand::UploadAndProcessFile {
+                        file_name,
+                        data,
+                        config,
+                    } => handle_upload_and_process(file_name, data, config, &state).await,
                 };
 
                 if let Ok(response_str) = serde_json::to_string(&response) {
@@ -99,11 +104,18 @@ async fn handle_process_local_file(
     config: Option<JobConfig>,
     state: &Arc<Mutex<AppState>>,
 ) -> ServerResponse {
+    // Use test.mp4 as default if file_path is empty
+    let file_path = if file_path.trim().is_empty() {
+        "test.mp4".to_string()
+    } else {
+        file_path
+    };
+
     let path = PathBuf::from(&file_path);
     if !path.exists() {
         return ServerResponse::Error {
             code: "FILE_NOT_FOUND".to_string(),
-            message: format!("File not found: {}", file_path),
+            message: format!("File not found: {}. Make sure test.mp4 exists in the working directory if using default path.", file_path),
         };
     }
 
@@ -340,4 +352,88 @@ async fn handle_disconnect_client(
             message: format!("Client not found: {}", client_id),
         }
     }
+}
+
+async fn handle_upload_and_process(
+    file_name: String,
+    data: Vec<u8>,
+    config: Option<JobConfig>,
+    state: &Arc<Mutex<AppState>>,
+) -> ServerResponse {
+    let temp_dir = PathBuf::from("work").join("server").join("uploads");
+    if !temp_dir.exists() {
+        if let Err(e) = tokio::fs::create_dir_all(&temp_dir).await {
+            return ServerResponse::Error {
+                code: "DIRECTORY_CREATE_FAILED".to_string(),
+                message: format!("Failed to create upload directory: {}", e),
+            };
+        }
+    }
+
+    let file_path = temp_dir.join(&file_name);
+    if let Err(e) = tokio::fs::write(&file_path, &data).await {
+        return ServerResponse::Error {
+            code: "FILE_WRITE_FAILED".to_string(),
+            message: format!("Failed to write uploaded file: {}", e),
+        };
+    }
+
+    // Detect format
+    let format = match SegmentManager::detect_format(file_path.to_str().unwrap()).await {
+        Ok(fmt) => fmt,
+        Err(e) => {
+            return ServerResponse::Error {
+                code: "FORMAT_DETECTION_FAILED".to_string(),
+                message: format!("Failed to detect file format: {}", e),
+            }
+        }
+    };
+
+    let job_id = {
+        let mut state = state.lock().await;
+        let config = config.unwrap_or_else(|| JobConfig {
+            ffmpeg_params: vec![
+                "-c:v".to_string(),
+                "libx264".to_string(),
+                "-preset".to_string(),
+                "medium".to_string(),
+            ],
+            required_clients: state.config.required_clients,
+            exactly: true,
+        });
+
+        state.current_input = Some(file_path.to_str().unwrap().to_string());
+        let job_id = state.job_queue.add_job(file_path, config, format);
+        state.current_job = Some(job_id.clone());
+
+        // Update the segment manager
+        state.segment_manager.set_job_id(job_id.clone());
+        if let Err(e) = state.segment_manager.init().await {
+            error!("Failed to initialize segment manager: {}", e);
+        }
+
+        job_id
+    };
+
+    // Send job notification to clients
+    let state = state.lock().await;
+    if let Some(job) = state.job_queue.get_job(&job_id) {
+        let msg = ServerMessage::ClientId {
+            id: "broadcast".to_string(),
+            job_id: job_id.clone(),
+        };
+
+        if let Ok(msg_str) = serde_json::to_string(&msg) {
+            let broadcast_msg = crate::ServerMessage {
+                target: None,
+                content: msg_str,
+            };
+
+            if let Err(e) = state.broadcast_tx.send(broadcast_msg) {
+                error!("Failed to broadcast job assignment: {}", e);
+            }
+        }
+    }
+
+    ServerResponse::JobCreated { job_id }
 }

@@ -35,6 +35,11 @@ pub enum ServerCommand {
     DisconnectClient {
         client_id: String,
     },
+    UploadAndProcessFile {
+        file_name: String,
+        data: Vec<u8>,
+        config: Option<JobConfig>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -114,6 +119,11 @@ pub enum ClientMessage {
     },
     Finish {
         fps: f64,
+    },
+    UploadAndProcessFile {
+        file_name: String,
+        data: Vec<u8>,
+        config: Option<JobConfig>,
     },
 }
 
