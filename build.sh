@@ -71,6 +71,99 @@ check_cross() {
     fi
 }
 
+# Function to create the release package
+# Function to create the release package
+create_release_package() {
+    local target=$1
+    local selected_component=$2
+    local base_dir=$(pwd)
+    local temp_release_dir="$base_dir/$TEMP_DIR/release_package"
+    
+    print_color "BLUE" "Preparing release package..."
+    rm -rf "$temp_release_dir"
+    mkdir -p "$temp_release_dir/bin"
+    
+    # Copy files based on component selection
+    case $selected_component in
+        0)  # Both client and server
+            # Copy client files
+            if [[ $target == windows* ]]; then
+                cp "$base_dir/$BUILD_DIR/ffmpeg-cluster-client/ffmpeg-cluster-client.exe" "$temp_release_dir/"
+                cp "$base_dir/$BUILD_DIR/client/bin/ffmpeg.exe" "$temp_release_dir/bin/"
+                cp "$base_dir/$BUILD_DIR/client/bin/ffprobe.exe" "$temp_release_dir/bin/"
+            else
+                cp "$base_dir/$BUILD_DIR/ffmpeg-cluster-client/ffmpeg-cluster-client" "$temp_release_dir/"
+                cp "$base_dir/$BUILD_DIR/client/bin/ffmpeg" "$temp_release_dir/bin/"
+                cp "$base_dir/$BUILD_DIR/client/bin/ffprobe" "$temp_release_dir/bin/"
+                chmod +x "$temp_release_dir/ffmpeg-cluster-client"
+                chmod +x "$temp_release_dir/bin/ffmpeg"
+                chmod +x "$temp_release_dir/bin/ffprobe"
+            fi
+            
+            # Copy server files
+            if [[ $target == windows* ]]; then
+                cp "$base_dir/$BUILD_DIR/ffmpeg-cluster-server/ffmpeg-cluster-server.exe" "$temp_release_dir/"
+            else
+                cp "$base_dir/$BUILD_DIR/ffmpeg-cluster-server/ffmpeg-cluster-server" "$temp_release_dir/"
+                chmod +x "$temp_release_dir/ffmpeg-cluster-server"
+            fi
+            ;;
+            
+        1)  # Client only
+            if [[ $target == windows* ]]; then
+                cp "$base_dir/$BUILD_DIR/ffmpeg-cluster-client/ffmpeg-cluster-client.exe" "$temp_release_dir/"
+                cp "$base_dir/$BUILD_DIR/client/bin/ffmpeg.exe" "$temp_release_dir/bin/"
+                cp "$base_dir/$BUILD_DIR/client/bin/ffprobe.exe" "$temp_release_dir/bin/"
+            else
+                cp "$base_dir/$BUILD_DIR/ffmpeg-cluster-client/ffmpeg-cluster-client" "$temp_release_dir/"
+                cp "$base_dir/$BUILD_DIR/client/bin/ffmpeg" "$temp_release_dir/bin/"
+                cp "$base_dir/$BUILD_DIR/client/bin/ffprobe" "$temp_release_dir/bin/"
+                chmod +x "$temp_release_dir/ffmpeg-cluster-client"
+                chmod +x "$temp_release_dir/bin/ffmpeg"
+                chmod +x "$temp_release_dir/bin/ffprobe"
+            fi
+            ;;
+            
+        2)  # Server only
+            if [[ $target == windows* ]]; then
+                cp "$base_dir/$BUILD_DIR/ffmpeg-cluster-server/ffmpeg-cluster-server.exe" "$temp_release_dir/"
+            else
+                cp "$base_dir/$BUILD_DIR/ffmpeg-cluster-server/ffmpeg-cluster-server" "$temp_release_dir/"
+                chmod +x "$temp_release_dir/ffmpeg-cluster-server"
+            fi
+            ;;
+    esac
+    
+    # Create the release directory if it doesn't exist
+    mkdir -p "$base_dir/$RELEASE_DIR"
+    
+    # Create the final archive
+    if [[ $target == windows* ]]; then
+        print_color "BLUE" "Creating Windows ZIP archive..."
+        (cd "$temp_release_dir" && zip -r "$base_dir/$RELEASE_DIR/ffmpeg-cluster-$target.zip" ./*) || {
+            print_color "RED" "Failed to create ZIP archive"
+            return 1
+        }
+    else
+        print_color "BLUE" "Creating tar.gz archive..."
+        (cd "$temp_release_dir" && tar czf "$base_dir/$RELEASE_DIR/ffmpeg-cluster-$target.tar.gz" ./*) || {
+            print_color "RED" "Failed to create tar.gz archive"
+            return 1
+        }
+    fi
+    
+    # Clean up
+    rm -rf "$temp_release_dir"
+    
+    # List the contents of the archive
+    echo
+    print_color "BLUE" "Archive contents:"
+    if [[ $target == windows* ]]; then
+        unzip -l "$base_dir/$RELEASE_DIR/ffmpeg-cluster-$target.zip"
+    else
+        tar tvf "$base_dir/$RELEASE_DIR/ffmpeg-cluster-$target.tar.gz"
+    fi
+}
 # Function to check Docker
 check_docker() {
     if ! command_exists docker; then
@@ -363,28 +456,11 @@ esac
 
 case $selected_component in
     0|2)  # Both or Server
-        build_component "ffmpeg_cluster_server" "$target" "$rust_target"
+        build_component "ffmpeg-cluster-server" "$target" "$rust_target"
         ;;
 esac
 
 # Create the release package
-mkdir -p release
-if [[ $target == windows* ]]; then
-    print_color "BLUE" "Creating Windows ZIP archive..."
-    cd build && zip -r "../release/ffmpeg-cluster-$target.zip" * && cd ..
-else
-    print_color "BLUE" "Creating tar.gz archive..."
-    cd build && tar czf "../release/ffmpeg-cluster-$target.tar.gz" * && cd ..
-fi
+# Create and package the release files
+create_release_package "$target" "$selected_component"
 
-print_color "GREEN" "Build complete!"
-print_color "BLUE" "Release package created in: release/ffmpeg-cluster-$target.$(if [[ $target == windows* ]]; then echo "zip"; else echo "tar.gz"; fi)"
-
-# List the contents of the archive
-echo
-print_color "BLUE" "Archive contents:"
-if [[ $target == windows* ]]; then
-    unzip -l "release/ffmpeg-cluster-$target.zip"
-else
-    tar tvf "release/ffmpeg-cluster-$target.tar.gz"
-fi

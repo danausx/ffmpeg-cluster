@@ -300,7 +300,7 @@ async fn distribute_segments(
     job_id: &str,
     client_ids: &[String],
 ) -> Result<(), anyhow::Error> {
-    let (input_file, fps, total_frames) = {
+    let (input_file, _fps, total_frames) = {
         let state = state_arc.lock().await;
         if let Some(input) = state.current_input.as_ref() {
             match crate::services::ffmpeg::FfmpegService::get_video_info(
@@ -324,7 +324,7 @@ async fn distribute_segments(
     let mut remaining_frames = total_frames % client_ids.len() as u64;
 
     let mut current_frame = 0;
-    for (i, client_id) in client_ids.iter().enumerate() {
+    for (_i, client_id) in client_ids.iter().enumerate() {
         // Calculate frames for this segment
         let mut segment_frames = frames_per_client;
         if remaining_frames > 0 {
