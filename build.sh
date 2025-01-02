@@ -45,13 +45,29 @@ trap 'handle_build_error' ERR
 check_cross() {
     if ! command_exists cross; then
         print_color "YELLOW" "Cross not found. Installing cross..."
-        cargo install cross --git https://github.com/cross-rs/cross || {
+        cargo install cross || {
             print_color "RED" "Failed to install cross"
             exit 1
         }
         print_color "GREEN" "Cross installed successfully"
     else
         print_color "GREEN" "Cross is already installed"
+    fi
+
+    # Pull the correct Docker image based on target
+    print_color "BLUE" "Pulling Docker image for $rust_target..."
+    
+    # Only use platform flag for x86_64 targets when on ARM64
+    if [[ "$rust_target" == *"x86_64"* ]]; then
+        docker pull --platform linux/amd64 "ghcr.io/cross-rs/$rust_target:main" || {
+            print_color "RED" "Failed to pull Docker image for $rust_target"
+            exit 1
+        }
+    else
+        docker pull "ghcr.io/cross-rs/$rust_target:main" || {
+            print_color "RED" "Failed to pull Docker image for $rust_target"
+            exit 1
+        }
     fi
 }
 
