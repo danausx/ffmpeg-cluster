@@ -283,7 +283,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_thread_names(false)
         .with_level(true)
         .with_ansi(true)
-        .with_timer(tracing_subscriber::fmt::time::LocalTime::rfc_3339())
+        .with_timer(true)
         .event_format(
             tracing_subscriber::fmt::format()
                 .with_level(true)
