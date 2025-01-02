@@ -12,6 +12,47 @@ print_color() {
     printf "${!1}%s${NC}\n" "$2"
 }
 
+# Function to detect native platform
+detect_native_platform() {
+    local os=$(uname -s)
+    local arch=$(uname -m)
+    local native_target=""
+    local native_rust_target=""
+
+    case "$os" in
+        Darwin)
+            case "$arch" in
+                x86_64)
+                    native_target="macos-x86_64"
+                    native_rust_target="x86_64-apple-darwin"
+                    ;;
+                arm64)
+                    native_target="macos-aarch64"
+                    native_rust_target="aarch64-apple-darwin"
+                    ;;
+            esac
+            ;;
+        Linux)
+            case "$arch" in
+                x86_64)
+                    native_target="linux-x86_64"
+                    native_rust_target="x86_64-unknown-linux-gnu"
+                    ;;
+                aarch64)
+                    native_target="linux-aarch64"
+                    native_rust_target="aarch64-unknown-linux-gnu"
+                    ;;
+            esac
+            ;;
+        MINGW*|MSYS*|CYGWIN*)
+            native_target="windows-x86_64"
+            native_rust_target="x86_64-pc-windows-gnu"
+            ;;
+    esac
+
+    echo "$native_target|$native_rust_target"
+}
+
 # Function to check if a command exists
 command_exists() {
     command -v "$1" >/dev/null 2>&1
@@ -71,99 +112,6 @@ check_cross() {
     fi
 }
 
-# Function to create the release package
-# Function to create the release package
-create_release_package() {
-    local target=$1
-    local selected_component=$2
-    local base_dir=$(pwd)
-    local temp_release_dir="$base_dir/$TEMP_DIR/release_package"
-    
-    print_color "BLUE" "Preparing release package..."
-    rm -rf "$temp_release_dir"
-    mkdir -p "$temp_release_dir/bin"
-    
-    # Copy files based on component selection
-    case $selected_component in
-        0)  # Both client and server
-            # Copy client files
-            if [[ $target == windows* ]]; then
-                cp "$base_dir/$BUILD_DIR/ffmpeg-cluster-client/ffmpeg-cluster-client.exe" "$temp_release_dir/"
-                cp "$base_dir/$BUILD_DIR/client/bin/ffmpeg.exe" "$temp_release_dir/bin/"
-                cp "$base_dir/$BUILD_DIR/client/bin/ffprobe.exe" "$temp_release_dir/bin/"
-            else
-                cp "$base_dir/$BUILD_DIR/ffmpeg-cluster-client/ffmpeg-cluster-client" "$temp_release_dir/"
-                cp "$base_dir/$BUILD_DIR/client/bin/ffmpeg" "$temp_release_dir/bin/"
-                cp "$base_dir/$BUILD_DIR/client/bin/ffprobe" "$temp_release_dir/bin/"
-                chmod +x "$temp_release_dir/ffmpeg-cluster-client"
-                chmod +x "$temp_release_dir/bin/ffmpeg"
-                chmod +x "$temp_release_dir/bin/ffprobe"
-            fi
-            
-            # Copy server files
-            if [[ $target == windows* ]]; then
-                cp "$base_dir/$BUILD_DIR/ffmpeg-cluster-server/ffmpeg-cluster-server.exe" "$temp_release_dir/"
-            else
-                cp "$base_dir/$BUILD_DIR/ffmpeg-cluster-server/ffmpeg-cluster-server" "$temp_release_dir/"
-                chmod +x "$temp_release_dir/ffmpeg-cluster-server"
-            fi
-            ;;
-            
-        1)  # Client only
-            if [[ $target == windows* ]]; then
-                cp "$base_dir/$BUILD_DIR/ffmpeg-cluster-client/ffmpeg-cluster-client.exe" "$temp_release_dir/"
-                cp "$base_dir/$BUILD_DIR/client/bin/ffmpeg.exe" "$temp_release_dir/bin/"
-                cp "$base_dir/$BUILD_DIR/client/bin/ffprobe.exe" "$temp_release_dir/bin/"
-            else
-                cp "$base_dir/$BUILD_DIR/ffmpeg-cluster-client/ffmpeg-cluster-client" "$temp_release_dir/"
-                cp "$base_dir/$BUILD_DIR/client/bin/ffmpeg" "$temp_release_dir/bin/"
-                cp "$base_dir/$BUILD_DIR/client/bin/ffprobe" "$temp_release_dir/bin/"
-                chmod +x "$temp_release_dir/ffmpeg-cluster-client"
-                chmod +x "$temp_release_dir/bin/ffmpeg"
-                chmod +x "$temp_release_dir/bin/ffprobe"
-            fi
-            ;;
-            
-        2)  # Server only
-            if [[ $target == windows* ]]; then
-                cp "$base_dir/$BUILD_DIR/ffmpeg-cluster-server/ffmpeg-cluster-server.exe" "$temp_release_dir/"
-            else
-                cp "$base_dir/$BUILD_DIR/ffmpeg-cluster-server/ffmpeg-cluster-server" "$temp_release_dir/"
-                chmod +x "$temp_release_dir/ffmpeg-cluster-server"
-            fi
-            ;;
-    esac
-    
-    # Create the release directory if it doesn't exist
-    mkdir -p "$base_dir/$RELEASE_DIR"
-    
-    # Create the final archive
-    if [[ $target == windows* ]]; then
-        print_color "BLUE" "Creating Windows ZIP archive..."
-        (cd "$temp_release_dir" && zip -r "$base_dir/$RELEASE_DIR/ffmpeg-cluster-$target.zip" ./*) || {
-            print_color "RED" "Failed to create ZIP archive"
-            return 1
-        }
-    else
-        print_color "BLUE" "Creating tar.gz archive..."
-        (cd "$temp_release_dir" && tar czf "$base_dir/$RELEASE_DIR/ffmpeg-cluster-$target.tar.gz" ./*) || {
-            print_color "RED" "Failed to create tar.gz archive"
-            return 1
-        }
-    fi
-    
-    # Clean up
-    rm -rf "$temp_release_dir"
-    
-    # List the contents of the archive
-    echo
-    print_color "BLUE" "Archive contents:"
-    if [[ $target == windows* ]]; then
-        unzip -l "$base_dir/$RELEASE_DIR/ffmpeg-cluster-$target.zip"
-    else
-        tar tvf "$base_dir/$RELEASE_DIR/ffmpeg-cluster-$target.tar.gz"
-    fi
-}
 # Function to check Docker
 check_docker() {
     if ! command_exists docker; then
@@ -197,6 +145,11 @@ print_menu_option() {
     printf "${GREEN}  %s${NC}) ${YELLOW}%s${NC}\n" "$1" "$2"
 }
 
+# Get native platform information
+NATIVE_PLATFORM_INFO=$(detect_native_platform)
+NATIVE_TARGET=$(echo $NATIVE_PLATFORM_INFO | cut -d'|' -f1)
+NATIVE_RUST_TARGET=$(echo $NATIVE_PLATFORM_INFO | cut -d'|' -f2)
+
 # Component selection menu
 print_menu_header "Component Selection"
 print_menu_option "1" "Both (Client + Server) [default]"
@@ -226,7 +179,7 @@ print_menu_option "3" "macOS (ARM64)"
 print_menu_option "4" "Linux (x86_64)"
 print_menu_option "5" "Linux (ARM64)"
 print_menu_option "6" "Windows (x86_64)"
-print_menu_option "7" "Current platform [default]"
+print_menu_option "7" "$NATIVE_TARGET [default]"
 print_menu_option "8" "Quit"
 printf "\nEnter your choice (1-8) [7]: "
 read -r platform_choice
@@ -271,9 +224,13 @@ case $platform_choice in
         exit 0
         ;;
     *)
-        target="native"
-        rust_target=""
-        ;;
+    target="$NATIVE_TARGET"
+    rust_target="$NATIVE_RUST_TARGET"
+    if [[ "$target" == linux* ]]; then
+        check_docker
+        check_cross
+    fi
+    ;;
 esac
 
 # Main directories
@@ -291,7 +248,10 @@ setup_build_dirs() {
     mkdir -p "$RELEASE_DIR"
 }
 
-# Function to download and extract FFmpeg if not already present
+# Setup build directories
+setup_build_dirs
+
+# Function to download and extract FFmpeg
 download_ffmpeg() {
     local os=$1
     # Convert to absolute paths
@@ -407,9 +367,9 @@ build_component() {
     # Create build directory
     mkdir -p "$BUILD_DIR/$component"
     
-    # Determine build command
+# Determine build command
     local build_cmd
-    if [ "$target" = "native" ]; then
+    if [[ "$target" == "$NATIVE_TARGET" ]]; then
         build_cmd="cargo build --release -p $component"
     elif [[ "$target" == linux* ]] || [ "$target" = "windows-x86_64" ]; then
         build_cmd="cross build --release --target $rust_target -p $component"
@@ -423,21 +383,125 @@ build_component() {
         exit 1
     fi
     
-    # Copy binary to build directory
+# Copy binary to build directory
     if [[ $target == windows* ]]; then
-        if [ "$target" = "native" ]; then
+        if [[ "$target" == "$NATIVE_TARGET" ]]; then
             cp "target/release/$component.exe" "$BUILD_DIR/$component/"
         else
             cp "target/$rust_target/release/$component.exe" "$BUILD_DIR/$component/"
         fi
     else
-        if [ "$target" = "native" ]; then
+        if [[ "$target" == "$NATIVE_TARGET" ]]; then
             cp "target/release/$component" "$BUILD_DIR/$component/"
             chmod +x "$BUILD_DIR/$component/$component"
         else
             cp "target/$rust_target/release/$component" "$BUILD_DIR/$component/"
             chmod +x "$BUILD_DIR/$component/$component"
         fi
+    fi
+}
+
+# Function to create the release package
+create_release_package() {
+    local target=$1
+    local selected_component=$2
+    local base_dir=$(pwd)
+    local temp_release_dir="$base_dir/$TEMP_DIR/release_package"
+    
+    print_color "BLUE" "Preparing release package..."
+    rm -rf "$temp_release_dir"
+    mkdir -p "$temp_release_dir/bin"
+    
+    # Helper function to copy FFmpeg binaries
+    copy_ffmpeg_binaries() {
+        local dest_dir="$1"
+        if [[ $target == windows* ]]; then
+            cp "$base_dir/$BUILD_DIR/client/bin/ffmpeg.exe" "$dest_dir/bin/"
+            cp "$base_dir/$BUILD_DIR/client/bin/ffprobe.exe" "$dest_dir/bin/"
+        else
+            cp "$base_dir/$BUILD_DIR/client/bin/ffmpeg" "$dest_dir/bin/"
+            cp "$base_dir/$BUILD_DIR/client/bin/ffprobe" "$dest_dir/bin/"
+            chmod +x "$dest_dir/bin/ffmpeg"
+            chmod +x "$dest_dir/bin/ffprobe"
+        fi
+    }
+    
+    # Copy files based on component selection
+    case $selected_component in
+        0)  # Both client and server
+            # Copy client files
+            if [[ $target == windows* ]]; then
+                cp "$base_dir/$BUILD_DIR/ffmpeg-cluster-client/ffmpeg-cluster-client.exe" "$temp_release_dir/"
+            else
+                cp "$base_dir/$BUILD_DIR/ffmpeg-cluster-client/ffmpeg-cluster-client" "$temp_release_dir/"
+                chmod +x "$temp_release_dir/ffmpeg-cluster-client"
+            fi
+            
+            # Copy server files
+            if [[ $target == windows* ]]; then
+                cp "$base_dir/$BUILD_DIR/ffmpeg-cluster-server/ffmpeg-cluster-server.exe" "$temp_release_dir/"
+            else
+                cp "$base_dir/$BUILD_DIR/ffmpeg-cluster-server/ffmpeg-cluster-server" "$temp_release_dir/"
+                chmod +x "$temp_release_dir/ffmpeg-cluster-server"
+            fi
+            
+            # Copy FFmpeg binaries
+            copy_ffmpeg_binaries "$temp_release_dir"
+            ;;
+            
+        1)  # Client only
+            if [[ $target == windows* ]]; then
+                cp "$base_dir/$BUILD_DIR/ffmpeg-cluster-client/ffmpeg-cluster-client.exe" "$temp_release_dir/"
+            else
+                cp "$base_dir/$BUILD_DIR/ffmpeg-cluster-client/ffmpeg-cluster-client" "$temp_release_dir/"
+                chmod +x "$temp_release_dir/ffmpeg-cluster-client"
+            fi
+            
+            # Copy FFmpeg binaries
+            copy_ffmpeg_binaries "$temp_release_dir"
+            ;;
+            
+        2)  # Server only
+            if [[ $target == windows* ]]; then
+                cp "$base_dir/$BUILD_DIR/ffmpeg-cluster-server/ffmpeg-cluster-server.exe" "$temp_release_dir/"
+            else
+                cp "$base_dir/$BUILD_DIR/ffmpeg-cluster-server/ffmpeg-cluster-server" "$temp_release_dir/"
+                chmod +x "$temp_release_dir/ffmpeg-cluster-server"
+            fi
+            
+            # Copy FFmpeg binaries for server
+            copy_ffmpeg_binaries "$temp_release_dir"
+            ;;
+    esac
+    
+    # Create the release directory if it doesn't exist
+    mkdir -p "$base_dir/$RELEASE_DIR"
+    
+    # Create the final archive
+    if [[ $target == windows* ]]; then
+        print_color "BLUE" "Creating Windows ZIP archive..."
+        (cd "$temp_release_dir" && zip -r "$base_dir/$RELEASE_DIR/ffmpeg-cluster-$target.zip" ./*) || {
+            print_color "RED" "Failed to create ZIP archive"
+            return 1
+        }
+    else
+        print_color "BLUE" "Creating tar.gz archive..."
+        (cd "$temp_release_dir" && tar czf "$base_dir/$RELEASE_DIR/ffmpeg-cluster-$target.tar.gz" ./*) || {
+            print_color "RED" "Failed to create tar.gz archive"
+            return 1
+        }
+    fi
+    
+    # Clean up
+    rm -rf "$temp_release_dir"
+    
+    # List the contents of the archive
+    echo
+    print_color "BLUE" "Archive contents:"
+    if [[ $target == windows* ]]; then
+        unzip -l "$base_dir/$RELEASE_DIR/ffmpeg-cluster-$target.zip"
+    else
+        tar tvf "$base_dir/$RELEASE_DIR/ffmpeg-cluster-$target.tar.gz"
     fi
 }
 
@@ -456,11 +520,16 @@ esac
 
 case $selected_component in
     0|2)  # Both or Server
+        # Download FFmpeg for server if it wasn't already downloaded
+        if [ "$selected_component" = "2" ]; then
+            download_ffmpeg "$target"
+        fi
         build_component "ffmpeg-cluster-server" "$target" "$rust_target"
         ;;
 esac
 
-# Create the release package
 # Create and package the release files
 create_release_package "$target" "$selected_component"
 
+print_color "GREEN" "Build complete!"
+print_color "BLUE" "Release package created in: release/ffmpeg-cluster-$target.$(if [[ $target == windows* ]]; then echo "zip"; else echo "tar.gz"; fi)"
