@@ -1,8 +1,4 @@
-use axum::{
-    extract::DefaultBodyLimit,
-    routing::get,
-    Router,
-};
+use axum::{extract::DefaultBodyLimit, routing::get, Router};
 use clap::Parser;
 use ffmpeg_cluster_common::models::config::ServerConfig;
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
