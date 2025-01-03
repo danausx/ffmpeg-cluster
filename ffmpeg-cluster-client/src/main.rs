@@ -1,6 +1,7 @@
 use clap::Parser;
 use ffmpeg_cluster_common::models::messages::{ClientMessage, ServerMessage, ServerResponse};
 use futures_util::{stream::SplitSink, SinkExt, StreamExt};
+use services::storage::{self, StorageManager};
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio_tungstenite::{
@@ -9,8 +10,8 @@ use tokio_tungstenite::{
     MaybeTlsStream, WebSocketStream,
 };
 use tracing::{error, info};
-
 mod ffmpeg;
+mod services;
 use ffmpeg::FfmpegProcessor;
 
 #[derive(Parser, Debug)]
@@ -103,9 +104,11 @@ async fn handle_connection(
     ws_stream: tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >,
+    storage: &StorageManager,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (mut write, mut read) = StreamExt::split(ws_stream);
     let mut chunk_state = ChunkState::default();
+    let mut last_update = std::time::Instant::now();
 
     if state.client_id.is_none() {
         let msg = serde_json::to_string(&ClientMessage::RequestId)?;
@@ -115,6 +118,12 @@ async fn handle_connection(
     while let Some(msg) = read.next().await {
         match msg {
             Ok(Message::Text(text)) => {
+                if last_update.elapsed() > std::time::Duration::from_secs(60) {
+                    if let Err(e) = storage.update_last_seen().await {
+                        error!("Failed to update last seen timestamp: {}", e);
+                    }
+                    last_update = std::time::Instant::now();
+                }
                 let server_msg: ServerMessage = serde_json::from_str(&text)?;
                 match server_msg {
                     ServerMessage::ClientId { id, job_id } => {
@@ -278,6 +287,7 @@ async fn upload_file(
     file_path: &str,
     participate: bool,
     mut ws_stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    storage: &StorageManager,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Read the file
     let data = tokio::fs::read(file_path).await?;
@@ -331,7 +341,9 @@ async fn upload_file(
     if participate {
         // If participating, hand over to normal connection handler
         let mut state = ClientState::new();
-        handle_connection(&mut state, ws_stream).await?;
+        if let Err(e) = handle_connection(&mut state, ws_stream, &storage).await {
+            error!("Connection error: {}", e);
+        }
     }
 
     Ok(())
@@ -339,6 +351,9 @@ async fn upload_file(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Initialize storage manager
+    let storage = StorageManager::new().await?;
+    let client_id = storage.get_id().to_string();
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
         .with_target(false)
@@ -363,7 +378,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match connect_to_server(&args).await {
             Ok(ws_stream) => {
                 info!("Connected to server, uploading file...");
-                upload_file(file_path, args.participate, ws_stream).await?;
+                upload_file(file_path, args.participate, ws_stream, &storage).await?;
                 if !args.participate {
                     return Ok(());
                 }
@@ -379,7 +394,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             match connect_to_server(&args).await {
                 Ok(ws_stream) => {
                     info!("Connected to server");
-                    if let Err(e) = handle_connection(&mut state, ws_stream).await {
+                    if let Err(e) = handle_connection(&mut state, ws_stream, &storage).await {
                         error!("Connection error: {}", e);
                     }
                 }

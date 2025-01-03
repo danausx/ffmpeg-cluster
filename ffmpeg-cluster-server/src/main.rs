@@ -11,7 +11,7 @@ mod handlers;
 mod services;
 
 use handlers::{command::command_ws_handler, websocket::ws_handler};
-use services::{job_queue::JobQueue, segment_manager::SegmentManager};
+use services::{database::DatabaseManager, job_queue::JobQueue, segment_manager::SegmentManager};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -59,6 +59,7 @@ pub struct AppState {
     pub current_job: Option<String>,
     pub current_input: Option<String>,
     pub client_segments: HashMap<String, String>, // Add this line - maps client_id to segment_id
+    pub db: DatabaseManager,
 }
 
 #[tokio::main]
@@ -92,8 +93,11 @@ async fn main() {
     let work_base = PathBuf::from("work");
     let server_work = work_base.join("server");
     let uploads_dir = server_work.join("uploads");
+    let db_dir = work_base.join("db"); // Add this line
 
-    for dir in [&work_base, &server_work, &uploads_dir] {
+    // Create all required directories
+    for dir in [&work_base, &server_work, &uploads_dir, &db_dir] {
+        // Add db_dir
         if !dir.exists() {
             if let Err(e) = std::fs::create_dir_all(dir) {
                 error!("Failed to create directory {}: {}", dir.display(), e);
@@ -103,6 +107,15 @@ async fn main() {
         }
     }
 
+    // Initialize database
+    let db = match DatabaseManager::new(db_dir.clone()).await {
+        // Change work_base to db_dir
+        Ok(db) => db,
+        Err(e) => {
+            error!("Failed to initialize database: {}", e);
+            return;
+        }
+    };
     // Create broadcast channel for client communication
     let (tx, _) = broadcast::channel(100);
 
@@ -131,6 +144,7 @@ async fn main() {
         current_job: None,
         current_input: None,
         client_segments: HashMap::new(), // Add this line
+        db,
     }));
 
     // Initialize segment manager

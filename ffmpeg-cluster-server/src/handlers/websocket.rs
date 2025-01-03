@@ -40,6 +40,10 @@ async fn handle_socket(
         let mut state = state_arc.lock().await;
         state.clients.insert(client_id.clone(), 0.0);
         info!("New client connected: {}", client_id);
+        // Register client in database
+        if let Err(e) = state.db.register_client(&client_id).await {
+            error!("Failed to register client in database: {}", e);
+        }
     }
 
     // Check for active job
