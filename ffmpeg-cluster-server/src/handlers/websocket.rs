@@ -16,6 +16,10 @@ pub async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<Arc<Mutex<AppState>>>,
 ) -> Response {
+    let ws = ws
+        .max_message_size(1024 * 1024 * 1024) // 1GB
+        .max_frame_size(64 * 1024 * 1024); // 64MB
+
     ws.on_upgrade(|socket| async move {
         if let Err(e) = handle_socket(socket, state).await {
             error!("WebSocket error: {}", e);

@@ -29,13 +29,13 @@ struct Args {
     #[arg(long, default_value = "3")]
     reconnect_delay: u64,
 
-    #[arg(long, default_value = "true")]
+    #[arg(long, default_value_t = true)]
     persistent: bool,
 
     #[arg(long)]
     upload_file: Option<String>,
 
-    #[arg(long, default_value = "false")]
+    #[arg(long, default_value_t = false)]
     participate: bool,
 }
 
@@ -81,16 +81,12 @@ async fn connect_to_server(
 ) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>, Box<dyn std::error::Error>> {
     let ws_url = format!("ws://{}:{}/ws", args.server_ip, args.server_port);
 
+    // Configure WebSocket settings
     let mut config = WebSocketConfig::default();
     config.max_message_size = Some(1024 * 1024 * 1024); // 1GB
     config.max_frame_size = Some(64 * 1024 * 1024); // 64MB
 
-    let (ws_stream, _) = connect_async_with_config(
-        &ws_url,
-        Some(config),
-        false, // Add this parameter for connect_async_with_config
-    )
-    .await?;
+    let (ws_stream, _) = connect_async_with_config(&ws_url, Some(config), false).await?;
 
     info!("Connected to server at {}", ws_url);
     Ok(ws_stream)
