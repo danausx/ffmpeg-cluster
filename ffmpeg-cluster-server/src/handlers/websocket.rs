@@ -1,3 +1,4 @@
+use crate::handlers::command::handle_upload_and_process;
 use crate::services::segment_manager::{SegmentData, SegmentManager};
 use crate::AppState;
 use axum::extract::ws::{Message, WebSocket};
@@ -137,6 +138,23 @@ async fn handle_socket(
                 ClientMessage::SegmentFailed { error } => {
                     if let Ok(mut state) = state_arc.try_lock() {
                         handle_segment_failed(&mut state, &client_id, error).await;
+                    }
+                }
+                ClientMessage::UploadAndProcessFile { file_name, data, config, participate } => {
+                    info!("Received file upload request from client {}: {} ({} bytes)",
+                        client_id, file_name, data.len());
+
+                    let response = handle_upload_and_process(
+                        file_name,
+                        data,
+                        config,
+                        &state_arc,
+                    ).await;
+
+                    if let Ok(response_str) = serde_json::to_string(&response) {
+                        if let Err(e) = sender.send(Message::Text(response_str.into())).await {
+                            error!("Failed to send upload response: {}", e);
+                        }
                     }
                 }
                 _ => {}

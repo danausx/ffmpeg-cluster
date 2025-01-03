@@ -415,16 +415,23 @@ async fn handle_disconnect_client(
     }
 }
 
-async fn handle_upload_and_process(
+pub async fn handle_upload_and_process(
     file_name: String,
     data: Vec<u8>,
     config: Option<JobConfig>,
     state: &Arc<Mutex<AppState>>,
 ) -> ServerResponse {
+    info!(
+        "Received file upload request: {} ({} bytes)",
+        file_name,
+        data.len()
+    );
+
     // Create upload directory if it doesn't exist
     let temp_dir = PathBuf::from("work").join("server").join("uploads");
     if !temp_dir.exists() {
         if let Err(e) = tokio::fs::create_dir_all(&temp_dir).await {
+            error!("Failed to create upload directory: {}", e);
             return ServerResponse::Error {
                 code: "DIRECTORY_CREATE_FAILED".to_string(),
                 message: format!("Failed to create upload directory: {}", e),
@@ -434,18 +441,146 @@ async fn handle_upload_and_process(
 
     // Save uploaded file
     let file_path = temp_dir.join(&file_name);
+    info!("Saving uploaded file to: {}", file_path.display());
+
     if let Err(e) = tokio::fs::write(&file_path, &data).await {
+        error!("Failed to write uploaded file: {}", e);
         return ServerResponse::Error {
             code: "FILE_WRITE_FAILED".to_string(),
             message: format!("Failed to write uploaded file: {}", e),
         };
     }
 
-    // Delegate to existing process_local_file handler
-    handle_process_local_file(
-        file_path.to_str().unwrap_or_default().to_string(),
-        config,
-        state,
-    )
-    .await
+    // Get canonical path
+    let canonical_path = match file_path.canonicalize() {
+        Ok(p) => p,
+        Err(e) => {
+            return ServerResponse::Error {
+                code: "PATH_RESOLUTION_ERROR".to_string(),
+                message: format!("Failed to resolve path {}: {}", file_path.display(), e),
+            };
+        }
+    };
+
+    info!(
+        "Attempting to detect format for file: {} (canonical path: {})",
+        file_name,
+        canonical_path.display()
+    );
+
+    // Detect format
+    let format =
+        match SegmentManager::detect_format(canonical_path.to_str().unwrap_or(&file_name)).await {
+            Ok(fmt) => fmt,
+            Err(e) => {
+                error!("Failed to detect format: {}", e);
+                return ServerResponse::Error {
+                    code: "FORMAT_DETECTION_FAILED".to_string(),
+                    message: format!("Failed to detect format: {}", e),
+                };
+            }
+        };
+
+    info!("Detected format: {}", format);
+
+    let job_id = {
+        let mut state = state.lock().await;
+        let config = config.unwrap_or_else(|| JobConfig {
+            ffmpeg_params: vec![
+                "-c:v".to_string(),
+                "libx264".to_string(),
+                "-preset".to_string(),
+                "medium".to_string(),
+            ],
+            required_clients: state.config.required_clients,
+            exactly: true,
+        });
+
+        state.current_input = Some(file_name.clone());
+        let job_id = state.job_queue.add_job(canonical_path, config, format);
+        state.current_job = Some(job_id.clone());
+
+        // Update the segment manager with the new job ID
+        state.segment_manager.set_job_id(job_id.clone());
+        // Reinitialize the segment manager
+        if let Err(e) = state.segment_manager.init().await {
+            error!("Failed to initialize segment manager: {}", e);
+        }
+
+        job_id
+    };
+
+    // First, send a new job notification to all connected clients
+    let state = state.lock().await;
+    if let Some(job) = state.job_queue.get_job(&job_id) {
+        let msg = ServerMessage::ClientId {
+            id: "broadcast".to_string(),
+            job_id: job_id.clone(),
+        };
+
+        let msg_str = match serde_json::to_string(&msg) {
+            Ok(str) => str,
+            Err(e) => {
+                return ServerResponse::Error {
+                    code: "SERIALIZATION_ERROR".to_string(),
+                    message: format!("Failed to serialize job message: {}", e),
+                };
+            }
+        };
+
+        let broadcast_msg = crate::ServerMessage {
+            target: None,
+            content: msg_str,
+        };
+
+        if let Err(e) = state.broadcast_tx.send(broadcast_msg) {
+            error!("Failed to broadcast job assignment: {}", e);
+            return ServerResponse::Error {
+                code: "BROADCAST_ERROR".to_string(),
+                message: format!("Failed to broadcast job assignment: {}", e),
+            };
+        }
+
+        // If we have enough clients, start the benchmark phase immediately
+        if state.clients.len() >= job.config.required_clients {
+            // Create and send benchmark data
+            if let Some(input_file) = state.current_input.as_ref() {
+                match state
+                    .segment_manager
+                    .create_benchmark_sample(input_file, state.config.benchmark_seconds)
+                    .await
+                {
+                    Ok(sample) => {
+                        let benchmark_msg = ServerMessage::BenchmarkRequest {
+                            data: sample.data,
+                            format: sample.format,
+                            params: state
+                                .config
+                                .ffmpeg_params
+                                .split_whitespace()
+                                .map(String::from)
+                                .collect(),
+                            job_id: job_id.clone(),
+                        };
+
+                        if let Ok(msg_str) = serde_json::to_string(&benchmark_msg) {
+                            let broadcast_msg = crate::ServerMessage {
+                                target: None,
+                                content: msg_str,
+                            };
+
+                            if let Err(e) = state.broadcast_tx.send(broadcast_msg) {
+                                error!("Failed to broadcast benchmark request: {}", e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to create benchmark sample: {}", e);
+                    }
+                }
+            }
+        }
+    }
+
+    ServerResponse::JobCreated { job_id }
 }

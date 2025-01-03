@@ -1,5 +1,5 @@
 use clap::Parser;
-use ffmpeg_cluster_common::models::messages::{ClientMessage, ServerMessage};
+use ffmpeg_cluster_common::models::messages::{ClientMessage, ServerMessage, ServerResponse};
 use futures_util::{stream::SplitSink, SinkExt, StreamExt};
 use std::time::Duration;
 use tokio::net::TcpStream;
@@ -281,13 +281,7 @@ async fn upload_file(
     mut ws_stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Read the file
-    let data = match tokio::fs::read(file_path).await {
-        Ok(data) => data,
-        Err(e) => {
-            error!("Failed to read file {}: {}", file_path, e);
-            return Err(Box::new(e));
-        }
-    };
+    let data = tokio::fs::read(file_path).await?;
 
     let file_name = std::path::Path::new(file_path)
         .file_name()
@@ -310,24 +304,36 @@ async fn upload_file(
         .send(Message::Text(serde_json::to_string(&message)?.into()))
         .await?;
 
-    // If not participating, wait for upload confirmation and return
-    if !participate {
-        while let Some(msg) = ws_stream.next().await {
-            match msg? {
-                Message::Text(text) => {
-                    info!("Server response: {}", text);
-                    break;
+    // Wait for proper response
+    while let Some(msg) = ws_stream.next().await {
+        match msg? {
+            Message::Text(text) => {
+                info!("Server response: {}", text);
+                // Parse the response to check for job creation or error
+                if let Ok(response) = serde_json::from_str::<ServerResponse>(&text) {
+                    match response {
+                        ServerResponse::JobCreated { job_id } => {
+                            info!("Job created successfully with ID: {}", job_id);
+                            break;
+                        }
+                        ServerResponse::Error { code, message } => {
+                            error!("Upload failed: {} - {}", code, message);
+                            return Err(format!("Upload failed: {}", message).into());
+                        }
+                        _ => continue,
+                    }
                 }
-                Message::Close(_) => break,
-                _ => continue,
             }
+            Message::Close(_) => break,
+            _ => continue,
         }
-        return Ok(());
     }
 
-    // If participating, hand over to normal connection handler
-    let mut state = ClientState::new();
-    handle_connection(&mut state, ws_stream).await?;
+    if participate {
+        // If participating, hand over to normal connection handler
+        let mut state = ClientState::new();
+        handle_connection(&mut state, ws_stream).await?;
+    }
 
     Ok(())
 }
