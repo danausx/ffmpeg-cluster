@@ -496,6 +496,11 @@ pub async fn handle_upload_and_process(
         }
     }
 
+    info!(
+        "File written and synced successfully. Absolute path: {}",
+        file_path.display()
+    );
+
     // Get canonical path
     let canonical_path = match file_path.canonicalize() {
         Ok(p) => p,
@@ -508,23 +513,32 @@ pub async fn handle_upload_and_process(
     };
 
     info!(
-        "Attempting to detect format for file: {} (canonical path: {})",
-        file_name,
-        canonical_path.display()
+        "Current working directory: {:?}",
+        std::env::current_dir().unwrap_or_default()
     );
 
+    info!("Canonical path resolved: {}", canonical_path.display());
+
+    let format_path = canonical_path.to_str().unwrap_or(&file_name);
+    info!("Attempting format detection with path: {}", format_path);
+
     // Detect format
-    let format =
-        match SegmentManager::detect_format(canonical_path.to_str().unwrap_or(&file_name)).await {
-            Ok(fmt) => fmt,
-            Err(e) => {
-                error!("Failed to detect format: {}", e);
-                return ServerResponse::Error {
-                    code: "FORMAT_DETECTION_FAILED".to_string(),
-                    message: format!("Failed to detect format: {}", e),
-                };
-            }
-        };
+    let format = match SegmentManager::detect_format(format_path).await {
+        Ok(fmt) => {
+            info!("Successfully detected format: {}", fmt);
+            fmt
+        }
+        Err(e) => {
+            error!(
+                "Format detection failed. Error: {}. Path used: {}. Error details: {:?}",
+                e, format_path, e
+            );
+            return ServerResponse::Error {
+                code: "FORMAT_DETECTION_FAILED".to_string(),
+                message: format!("Failed to detect format: {}. Path: {}", e, format_path),
+            };
+        }
+    };
 
     info!("Detected format: {}", format);
 
