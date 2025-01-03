@@ -223,9 +223,6 @@ pub async fn handle_process_local_file(
                 let job_ffmpeg_params = job.config.ffmpeg_params.clone();
                 let required_clients = job.config.required_clients;
 
-                // Drop the job borrow
-                drop(job);
-
                 state.current_job = Some(job_id.clone());
                 state.current_input = Some(job_file_path.clone());
 
