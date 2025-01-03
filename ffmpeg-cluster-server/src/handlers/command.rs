@@ -164,6 +164,12 @@ async fn handle_process_local_file(
         }
     };
 
+    info!(
+        "Attempting to detect format for file: {} (canonical path: {})",
+        file_path,
+        canonical_path.display()
+    );
+
     let format =
         match SegmentManager::detect_format(canonical_path.to_str().unwrap_or(&file_path)).await {
             Ok(fmt) => fmt,

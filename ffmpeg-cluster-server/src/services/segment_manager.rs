@@ -1,5 +1,6 @@
 // ffmpeg-cluster-server/src/services/segment_manager.rs
 
+use super::ffmpeg::FfmpegService;
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -295,26 +296,8 @@ impl SegmentManager {
         &self.work_dir
     }
 
-    pub async fn detect_format(input_file: &str) -> Result<String> {
-        let format_output = Command::new("ffprobe")
-            .args([
-                "-v",
-                "error",
-                "-show_entries",
-                "format=format_name",
-                "-of",
-                "default=noprint_wrappers=1:nokey=1",
-                input_file,
-            ])
-            .output()
-            .await?;
-
-        let format = String::from_utf8_lossy(&format_output.stdout)
-            .trim()
-            .to_string();
-
-        info!("Detected input format: {}", format);
-        Ok(format)
+    pub async fn detect_format(file_path: &str) -> Result<String> {
+        FfmpegService::detect_format(file_path).await
     }
 
     pub fn get_output_format(input_format: &str) -> (&'static str, Vec<&'static str>) {
