@@ -3,7 +3,6 @@ use ffmpeg_cluster_common::models::messages::{ClientMessage, ServerMessage, Serv
 use futures_util::{stream::SplitSink, SinkExt, StreamExt};
 use std::time::Duration;
 use tokio::net::TcpStream;
-use tokio_tungstenite::tungstenite::protocol::Role;
 use tokio_tungstenite::{
     connect_async_with_config,
     tungstenite::protocol::{Message, WebSocketConfig},

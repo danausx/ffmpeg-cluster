@@ -1,6 +1,5 @@
 // ffmpeg-cluster-server/src/services/segment_manager.rs
 
-use super::ffmpeg::FfmpegService;
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};

@@ -11,7 +11,6 @@ use ffmpeg_cluster_common::models::messages::{
     VideoData,
 };
 use futures::{SinkExt, StreamExt};
-use std::path::Path;
 use std::{path::PathBuf, sync::Arc};
 use tokio::sync::Mutex;
 use tokio::{fs::File, io::AsyncWriteExt};
