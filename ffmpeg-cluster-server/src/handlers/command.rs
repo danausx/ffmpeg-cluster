@@ -1,4 +1,4 @@
-use crate::{services::segment_manager::SegmentManager, AppState};
+use crate::AppState;
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -13,9 +13,7 @@ use ffmpeg_cluster_common::models::messages::{
 use futures::{SinkExt, StreamExt};
 use std::{path::PathBuf, sync::Arc};
 use tokio::sync::Mutex;
-use tokio::{fs::File, io::AsyncWriteExt};
 use tracing::{error, info};
-use uuid::Uuid;
 
 pub async fn command_ws_handler(
     ws: WebSocketUpgrade,
@@ -472,7 +470,7 @@ pub async fn handle_upload_and_process(
 
     // Third phase: Start processing if needed
     if should_start_processing {
-        let mut state = state.lock().await;
+        let state = state.lock().await;
         let client_count = state.clients.len();
 
         if client_count >= job_config.required_clients {

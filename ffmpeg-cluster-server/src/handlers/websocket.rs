@@ -1,5 +1,5 @@
 use crate::handlers::command::handle_upload_and_process;
-use crate::services::segment_manager::{SegmentData, SegmentManager};
+use crate::services::segment_manager::SegmentData;
 use crate::AppState;
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{ws::WebSocketUpgrade, State};

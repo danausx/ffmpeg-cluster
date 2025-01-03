@@ -1,6 +1,5 @@
 use directories::ProjectDirs;
 use sqlx::{sqlite::SqlitePool, Row};
-use std::path::PathBuf;
 use uuid::Uuid;
 
 pub struct StorageManager {

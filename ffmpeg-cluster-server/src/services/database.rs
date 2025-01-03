@@ -1,6 +1,5 @@
 use sqlx::sqlite::SqlitePool;
 use std::path::PathBuf;
-use uuid::Uuid;
 
 pub struct DatabaseManager {
     pool: SqlitePool,

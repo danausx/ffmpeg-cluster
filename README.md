@@ -16,72 +16,230 @@ FFmpeg Cluster is a distributed video processing system built in Rust that lever
 - **Frame-Accurate Processing**: Precise frame handling during splitting and recombination
 - **Automatic Recovery**: Built-in retry mechanisms and error handling
 - **Real-time Monitoring**: Live progress tracking and client status updates
+- **SQLite Integration**: Client and job tracking with persistent storage
+- **Format Detection**: Automatic video format detection and handling
+- **Multi-platform Support**: Works on Windows, macOS, and Linux
 
 ## Architecture
 
-The project is composed of three main Rust components:
+The project consists of three main Rust components:
 
 1. **ffmpeg-cluster-server**: 
    - Coordinates client connections
    - Manages video segment distribution
-   - Handles websocket communications
-   - Orchestrates the overall encoding process
+   - Handles WebSocket communications
+   - Orchestrates the encoding process
+   - Manages SQLite database for tracking
+   - Provides REST API endpoints
 
 2. **ffmpeg-cluster-client**:
    - Connects to the server
    - Performs video processing tasks
-   - Uploads processed video segments
+   - Manages local FFmpeg binaries
+   - Handles hardware acceleration detection
+   - Supports automatic reconnection
+   - Maintains persistent client ID
 
 3. **ffmpeg-cluster-common**:
-   - Shared models and error handling
-   - Common message structures
+   - Shared models and error types
+   - Message structures
    - Configuration management
+   - Job and client state definitions
 
 ## Prerequisites
 
 - Rust (latest stable version)
-- FFmpeg (automatically managed by the client)
+- Docker (for cross-compilation)
+- curl and unzip (for FFmpeg download)
 
-## Configuration
+FFmpeg is automatically downloaded and managed by the client.
+
+## Building
+
+### Build Script Usage
+
+The project includes a comprehensive build script (`build.sh`) that handles:
+- Cross-compilation
+- FFmpeg binary management
+- Platform-specific builds
+- Release packaging
+
+```bash
+# Build both client and server (default)
+./build.sh
+
+# Build client only
+./build.sh -c client
+
+# Build server only
+./build.sh -c server
+
+# Build for specific platform
+./build.sh -p linux-x86_64
+./build.sh -p macos-universal2
+./build.sh -p windows-x86_64
+```
+
+## Running the Server
+
+### Basic Usage
+
+```bash
+./ffmpeg-cluster-server
+```
+
+### Advanced Configuration
+
+```bash
+./ffmpeg-cluster-server \
+  --required-clients 3 \
+  --benchmark-duration 10 \
+  --ffmpeg-params "-c:v libx264 -preset medium" \
+  --file-name-output "output.mp4" \
+  --port 5001 \
+  --exactly true \
+  --chunk-size 1048576 \
+  --max-retries 3 \
+  --retry-delay 5
+```
 
 ### Server Options
-- `--required-clients`: Number of clients needed (default: 3)
-- `--benchmark-duration`: Benchmark duration in seconds (default: 10)
-- `--ffmpeg-params`: FFmpeg encoding parameters
-- `--file-name-output`: Output filename
-- `--port`: Server port (default: 5001)
-- `--exactly`: Enable exact frame counting (default: true)
-- `--chunk-size`: Data chunk size in bytes (default: 1MB)
-- `--max-retries`: Maximum retry attempts (default: 3)
-- `--retry-delay`: Delay between retries in seconds (default: 5)
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| --required-clients | Number of clients needed | 3 |
+| --benchmark-duration | Benchmark duration (seconds) | 10 |
+| --ffmpeg-params | FFmpeg encoding parameters | -c:v libx264 -preset medium |
+| --file-name-output | Output filename | output.mp4 |
+| --port | Server port | 5001 |
+| --exactly | Enable exact frame counting | true |
+| --chunk-size | Data chunk size (bytes) | 1MB |
+| --max-retries | Maximum retry attempts | 3 |
+| --retry-delay | Delay between retries (seconds) | 5 |
+
+## Running the Client
+
+### Basic Usage
+
+```bash
+./ffmpeg-cluster-client
+```
+
+### Advanced Configuration
+
+```bash
+./ffmpeg-cluster-client \
+  --server-ip localhost \
+  --server-port 5001 \
+  --benchmark-duration 10 \
+  --reconnect-delay 3 \
+  --persistent true \
+  --participate true
+```
 
 ### Client Options
-- `--server-ip`: Server address (default: localhost)
-- `--server-port`: Server port (default: 5001)
-- `--benchmark-duration`: Benchmark duration (default: 10)
-- `--reconnect-delay`: Reconnection delay in seconds (default: 3)
-- `--persistent`: Keep trying to reconnect (default: true)
 
-## Job States
+| Option | Description | Default |
+|--------|-------------|---------|
+| --server-ip | Server address | localhost |
+| --server-port | Server port | 5001 |
+| --benchmark-duration | Benchmark duration (seconds) | 10 |
+| --reconnect-delay | Reconnection delay (seconds) | 3 |
+| --persistent | Keep trying to reconnect | true |
+| --participate | Join processing after upload | false |
+| --upload-file | File to upload for processing | none |
+
+## File Processing
+
+### Direct Upload and Processing
+
+```bash
+# Upload and process a file
+./ffmpeg-cluster-client --upload-file input.mp4
+
+# Upload and participate in processing
+./ffmpeg-cluster-client --upload-file input.mp4 --participate true
+```
+
+### Server-side Processing
+
+```bash
+# Process local file on server
+curl -X POST http://localhost:5001/ws/command \
+  -H "Content-Type: application/json" \
+  -d '{"ProcessLocalFile":{"file_path":"input.mp4"}}'
+```
+
+## Job Management
 
 Jobs progress through the following states:
-- Queued
-- WaitingForClients
-- Benchmarking
-- Processing
-- Combining
-- Completed
-- Failed
-- Cancelled
+1. **Queued**: Job is waiting for processing
+2. **WaitingForClients**: Waiting for required number of clients
+3. **Benchmarking**: Testing client performance
+4. **Processing**: Active video processing
+5. **Combining**: Merging processed segments
+6. **Completed**: Processing finished successfully
+7. **Failed**: Processing encountered an error
+8. **Cancelled**: Job was manually cancelled
 
-## Client States
+### Job Commands
+
+```bash
+# List all jobs
+curl http://localhost:5001/ws/command \
+  -H "Content-Type: application/json" \
+  -d '{"ListJobs":null}'
+
+# Get job status
+curl http://localhost:5001/ws/command \
+  -H "Content-Type: application/json" \
+  -d '{"GetJobStatus":{"job_id":"YOUR_JOB_ID"}}'
+
+# Cancel job
+curl http://localhost:5001/ws/command \
+  -H "Content-Type: application/json" \
+  -d '{"CancelJob":{"job_id":"YOUR_JOB_ID"}}'
+```
+
+## Client Management
 
 Clients can be in the following states:
-- Connected
-- Benchmarking
-- Processing
-- Idle
-- Disconnected
+- **Connected**: Initial connection established
+- **Benchmarking**: Performance testing
+- **Processing**: Active video processing
+- **Idle**: Waiting for work
+- **Disconnected**: Connection lost
+
+### Client Commands
+
+```bash
+# List all clients
+curl http://localhost:5001/ws/command \
+  -H "Content-Type: application/json" \
+  -d '{"ListClients":null}'
+
+# Disconnect client
+curl http://localhost:5001/ws/command \
+  -H "Content-Type: application/json" \
+  -d '{"DisconnectClient":{"client_id":"CLIENT_ID"}}'
+```
+
+## Directory Structure
+
+```
+work/
+├── client/
+│   └── {client_id}/
+│       ├── benchmark/
+│       └── segment_{uuid}/
+├── server/
+│   ├── uploads/
+│   └── {job_id}/
+│       └── segments/
+└── db/
+    ├── client.db
+    └── server.db
+```
 
 ## Performance Considerations
 
@@ -91,6 +249,8 @@ Clients can be in the following states:
   - Input video characteristics
   - Number of connected clients
   - Client hardware capabilities
+  - Video codec and format
+  - Segment size distribution
 
 ## Error Handling
 
@@ -100,6 +260,8 @@ The system includes comprehensive error handling for:
 - Frame count mismatches
 - Hardware acceleration issues
 - Corrupt video segments
+- Database operations
+- File system operations
 
 ## Contributing
 
@@ -108,3 +270,7 @@ The system includes comprehensive error handling for:
 3. Commit your changes (`git commit -m 'Add some AmazingFeature'`)
 4. Push to the branch (`git push origin feature/AmazingFeature`)
 5. Open a Pull Request
+
+## License
+
+This project is licensed under the MIT License - see the LICENSE file for details.
