@@ -21,7 +21,7 @@ pub async fn command_ws_handler(
 ) -> Response {
     let ws = ws
         .max_message_size(1024 * 1024 * 1024) // 1GB
-        .max_frame_size(64 * 1024 * 1024); // 64MB
+        .max_frame_size(1024 * 1024 * 1024); // 1GB
 
     ws.on_upgrade(|socket| async move {
         if let Err(e) = handle_command_socket(socket, state).await {
