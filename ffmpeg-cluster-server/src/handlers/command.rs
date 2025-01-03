@@ -11,10 +11,12 @@ use ffmpeg_cluster_common::models::messages::{
     VideoData,
 };
 use futures::{SinkExt, StreamExt};
+use std::path::Path;
 use std::{path::PathBuf, sync::Arc};
 use tokio::sync::Mutex;
 use tokio::{fs::File, io::AsyncWriteExt};
 use tracing::{error, info};
+use uuid::Uuid;
 
 pub async fn command_ws_handler(
     ws: WebSocketUpgrade,
@@ -440,8 +442,16 @@ pub async fn handle_upload_and_process(
         }
     }
 
-    // Save uploaded file
-    let file_path = temp_dir.join(&file_name);
+    // Generate UUID for the file
+    let file_uuid = Uuid::new_v4();
+    let file_ext = std::path::Path::new(&file_name)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("mp4");
+
+    // Create filename with UUID
+    let unique_filename = format!("{}_{}.{}", file_uuid, file_name, file_ext);
+    let file_path = temp_dir.join(&unique_filename);
     info!("Saving uploaded file to: {}", file_path.display());
 
     // Ensure file is properly written and synced
@@ -472,6 +482,17 @@ pub async fn handle_upload_and_process(
         };
     }
 
+    // Add a small delay to ensure filesystem sync
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    // Verify file exists and is readable
+    if !file_path.exists() {
+        return ServerResponse::Error {
+            code: "FILE_VERIFY_FAILED".to_string(),
+            message: "File was not properly saved".to_string(),
+        };
+    }
+
     // Verify file size
     match tokio::fs::metadata(&file_path).await {
         Ok(metadata) => {
@@ -496,12 +517,7 @@ pub async fn handle_upload_and_process(
         }
     }
 
-    info!(
-        "File written and synced successfully. Absolute path: {}",
-        file_path.display()
-    );
-
-    // Get canonical path
+    // Store the absolute path in the state for future reference
     let canonical_path = match file_path.canonicalize() {
         Ok(p) => p,
         Err(e) => {
@@ -512,35 +528,23 @@ pub async fn handle_upload_and_process(
         }
     };
 
-    info!(
-        "Current working directory: {:?}",
-        std::env::current_dir().unwrap_or_default()
-    );
-
     info!("Canonical path resolved: {}", canonical_path.display());
-
-    let format_path = canonical_path.to_str().unwrap_or(&file_name);
-    info!("Attempting format detection with path: {}", format_path);
-
-    // Detect format
-    let format = match SegmentManager::detect_format(format_path).await {
-        Ok(fmt) => {
-            info!("Successfully detected format: {}", fmt);
-            fmt
-        }
-        Err(e) => {
-            error!(
-                "Format detection failed. Error: {}. Path used: {}. Error details: {:?}",
-                e, format_path, e
-            );
-            return ServerResponse::Error {
-                code: "FORMAT_DETECTION_FAILED".to_string(),
-                message: format!("Failed to detect format: {}. Path: {}", e, format_path),
-            };
-        }
-    };
-
-    info!("Detected format: {}", format);
+    let format =
+        match SegmentManager::detect_format(canonical_path.to_str().unwrap_or(&unique_filename))
+            .await
+        {
+            Ok(fmt) => {
+                info!("Successfully detected format: {}", fmt);
+                fmt
+            }
+            Err(e) => {
+                error!("Format detection failed: {}", e);
+                return ServerResponse::Error {
+                    code: "FORMAT_DETECTION_FAILED".to_string(),
+                    message: format!("Failed to detect format: {}", e),
+                };
+            }
+        };
 
     let job_id = {
         let mut state = state.lock().await;
@@ -555,13 +559,17 @@ pub async fn handle_upload_and_process(
             exactly: true,
         });
 
-        state.current_input = Some(file_name.clone());
+        // Store both the filename and the full path
+        state.current_input = Some(
+            canonical_path
+                .to_str()
+                .unwrap_or(&unique_filename)
+                .to_string(),
+        );
         let job_id = state.job_queue.add_job(canonical_path, config, format);
         state.current_job = Some(job_id.clone());
 
-        // Update the segment manager with the new job ID
         state.segment_manager.set_job_id(job_id.clone());
-        // Reinitialize the segment manager
         if let Err(e) = state.segment_manager.init().await {
             error!("Failed to initialize segment manager: {}", e);
         }
@@ -569,7 +577,7 @@ pub async fn handle_upload_and_process(
         job_id
     };
 
-    // First, send a new job notification to all connected clients
+    // Handle client notifications and benchmark phase
     let state = state.lock().await;
     if let Some(job) = state.job_queue.get_job(&job_id) {
         let msg = ServerMessage::ClientId {
@@ -577,32 +585,23 @@ pub async fn handle_upload_and_process(
             job_id: job_id.clone(),
         };
 
-        let msg_str = match serde_json::to_string(&msg) {
-            Ok(str) => str,
-            Err(e) => {
+        if let Ok(msg_str) = serde_json::to_string(&msg) {
+            let broadcast_msg = crate::ServerMessage {
+                target: None,
+                content: msg_str,
+            };
+
+            if let Err(e) = state.broadcast_tx.send(broadcast_msg) {
+                error!("Failed to broadcast job assignment: {}", e);
                 return ServerResponse::Error {
-                    code: "SERIALIZATION_ERROR".to_string(),
-                    message: format!("Failed to serialize job message: {}", e),
+                    code: "BROADCAST_ERROR".to_string(),
+                    message: format!("Failed to broadcast job assignment: {}", e),
                 };
             }
-        };
-
-        let broadcast_msg = crate::ServerMessage {
-            target: None,
-            content: msg_str,
-        };
-
-        if let Err(e) = state.broadcast_tx.send(broadcast_msg) {
-            error!("Failed to broadcast job assignment: {}", e);
-            return ServerResponse::Error {
-                code: "BROADCAST_ERROR".to_string(),
-                message: format!("Failed to broadcast job assignment: {}", e),
-            };
         }
 
-        // If we have enough clients, start the benchmark phase immediately
+        // Start benchmark phase if enough clients
         if state.clients.len() >= job.config.required_clients {
-            // Create and send benchmark data
             if let Some(input_file) = state.current_input.as_ref() {
                 match state
                     .segment_manager

@@ -300,8 +300,29 @@ impl SegmentManager {
     pub async fn detect_format(path: &str) -> Result<String, std::io::Error> {
         info!("Attempting to detect format using ffmpeg...");
 
-        let ffmpeg_cmd = format!("ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of default=noprint_wrappers=1:nokey=1 {}", path);
-        info!("Executing command: {}", ffmpeg_cmd);
+        let path = Path::new(path);
+        let absolute_path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            // Check if path already includes the uploads directory
+            if path.to_str().unwrap_or("").contains("uploads") {
+                PathBuf::from(path)
+            } else {
+                PathBuf::from("work/server/uploads").join(path)
+            }
+        };
+
+        if !absolute_path.exists() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("File not found: {}", absolute_path.display()),
+            ));
+        }
+
+        info!(
+            "Using absolute path for format detection: {}",
+            absolute_path.display()
+        );
 
         let output = match tokio::process::Command::new("ffprobe")
             .args([
@@ -313,7 +334,7 @@ impl SegmentManager {
                 "stream=codec_name",
                 "-of",
                 "default=noprint_wrappers=1:nokey=1",
-                path,
+                absolute_path.to_str().unwrap_or(""),
             ])
             .output()
             .await
@@ -351,11 +372,9 @@ impl SegmentManager {
         }
 
         let format = String::from_utf8_lossy(&output.stdout).trim().to_string();
-
         info!("Format detection successful. Detected format: {}", format);
         Ok(format)
     }
-
     pub fn get_output_format(input_format: &str) -> (&'static str, Vec<&'static str>) {
         // Split by comma and take first format
         let format = input_format.split(',').next().unwrap_or("").trim();
@@ -610,7 +629,8 @@ impl SegmentManager {
             while let Some(entry) = entries.next_entry().await? {
                 if entry.file_type().await?.is_dir() {
                     let path = entry.path();
-                    if path != self.work_dir {
+                    // Skip the uploads directory and current work directory
+                    if path != self.work_dir && !path.ends_with("uploads") {
                         info!("Cleaning up old job directory: {}", path.display());
                         if let Err(e) = tokio::fs::remove_dir_all(&path).await {
                             warn!("Failed to remove old job directory: {}", e);
