@@ -106,3 +106,4 @@ Cargo.lock
 .github/dependabot.yml
 ffprobe
 ffmpeg
+.env
