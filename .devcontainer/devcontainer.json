@@ -1,0 +1,20 @@
+{
+    "name": "Rust",
+    "image": "mcr.microsoft.com/devcontainers/rust:1-1-bookworm",
+    "customizations": {
+        "vscode": {
+            "settings": {},
+            "extensions": [
+                "rust-lang.rust-analyzer",
+                "tamasfe.even-better-toml",
+                "serayuzgur.crates"
+            ]
+        }
+    },
+    "runArgs": [
+        "--platform=linux/arm64",
+        "-p=5001:5001"
+    ],
+    "postCreateCommand": "rustc --version",
+    "remoteUser": "root"
+}

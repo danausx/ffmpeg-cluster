@@ -111,23 +111,73 @@ async fn handle_process_local_file(
         file_path
     };
 
-    let path = PathBuf::from(&file_path);
+    // Convert to absolute path and normalize
+    let path = if PathBuf::from(&file_path).is_absolute() {
+        PathBuf::from(&file_path)
+    } else {
+        // If relative, join with current working directory
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(&file_path)
+    };
+
+    // Ensure the path exists and is readable
     if !path.exists() {
         return ServerResponse::Error {
             code: "FILE_NOT_FOUND".to_string(),
-            message: format!("File not found: {}. Make sure test.mp4 exists in the working directory if using default path.", file_path),
+            message: format!(
+                "File not found: {}. Current working directory: {}",
+                file_path,
+                std::env::current_dir()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| "unknown".to_string())
+            ),
         };
     }
 
-    let format = match SegmentManager::detect_format(&file_path).await {
-        Ok(fmt) => fmt,
-        Err(e) => {
-            return ServerResponse::Error {
-                code: "FORMAT_DETECTION_FAILED".to_string(),
-                message: format!("Failed to detect file format: {}", e),
+    // Check if file is readable
+    match std::fs::metadata(&path) {
+        Ok(metadata) => {
+            if !metadata.is_file() {
+                return ServerResponse::Error {
+                    code: "INVALID_FILE".to_string(),
+                    message: format!("Path exists but is not a file: {}", file_path),
+                };
             }
         }
+        Err(e) => {
+            return ServerResponse::Error {
+                code: "FILE_ACCESS_ERROR".to_string(),
+                message: format!("Cannot access file {}: {}", file_path, e),
+            };
+        }
+    }
+
+    // Get canonical path
+    let canonical_path = match path.canonicalize() {
+        Ok(p) => p,
+        Err(e) => {
+            return ServerResponse::Error {
+                code: "PATH_RESOLUTION_ERROR".to_string(),
+                message: format!("Failed to resolve path {}: {}", file_path, e),
+            };
+        }
     };
+
+    let format =
+        match SegmentManager::detect_format(canonical_path.to_str().unwrap_or(&file_path)).await {
+            Ok(fmt) => fmt,
+            Err(e) => {
+                return ServerResponse::Error {
+                    code: "FORMAT_DETECTION_FAILED".to_string(),
+                    message: format!(
+                        "Failed to detect file format for {}: {}",
+                        canonical_path.display(),
+                        e
+                    ),
+                };
+            }
+        };
 
     let job_id = {
         let mut state = state.lock().await;
