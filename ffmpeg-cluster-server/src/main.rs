@@ -9,6 +9,7 @@ use tracing_subscriber::FmtSubscriber;
 
 mod handlers;
 mod services;
+mod utils;
 
 use handlers::{command::command_ws_handler, websocket::ws_handler};
 use services::{database::DatabaseManager, job_queue::JobQueue, segment_manager::SegmentManager};

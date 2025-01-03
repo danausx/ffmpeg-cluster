@@ -1,5 +1,7 @@
 // ffmpeg-cluster-server/src/services/segment_manager.rs
 
+use super::ffprobe::FfProbeService;
+use crate::utils::path::ensure_absolute_path;
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -44,46 +46,6 @@ impl SegmentManager {
             detected_format: None,
             total_segments: 0,
         }
-    }
-
-    // Add a new method to save segment data to disk
-    async fn save_segment_to_disk(
-        &self,
-        segment_id: &str,
-        data: &[u8],
-        format: &str,
-    ) -> Result<PathBuf> {
-        let segment_dir = self.work_dir.join("segments");
-        if !segment_dir.exists() {
-            tokio::fs::create_dir_all(&segment_dir).await?;
-        }
-
-        let file_path = segment_dir.join(format!("{}.{}", segment_id, format));
-        tokio::fs::write(&file_path, data).await?;
-
-        // Verify the segment
-        let probe_output = Command::new("ffprobe")
-            .args([
-                "-v",
-                "error",
-                "-show_entries",
-                "format=duration",
-                file_path.to_str().unwrap(),
-            ])
-            .output()
-            .await?;
-
-        if !probe_output.status.success() {
-            let err = format!(
-                "Segment {} is corrupted: {}",
-                segment_id,
-                String::from_utf8_lossy(&probe_output.stderr)
-            );
-            tokio::fs::remove_file(&file_path).await?;
-            anyhow::bail!(err);
-        }
-
-        Ok(file_path)
     }
 
     // Update the add_processed_segment method
@@ -136,32 +98,15 @@ impl SegmentManager {
             tokio::fs::write(&segment_path, &segment.data).await?;
 
             // Verify segment frame count
-            let frame_count = Command::new("ffprobe")
-                .args([
-                    "-v",
-                    "error",
-                    "-select_streams",
-                    "v:0",
-                    "-count_packets",
-                    "-show_entries",
-                    "stream=nb_read_packets",
-                    "-of",
-                    "csv=p=0",
-                    segment_path.to_str().unwrap(),
-                ])
-                .output()
-                .await?;
+            let frame_count = FfProbeService::count_frames(segment_path.to_str().unwrap()).await?;
 
-            if !frame_count.status.success() {
+            if frame_count == 0 {
                 let err = format!("Failed to verify segment {} frame count", i);
                 error!("{}", err);
                 return Err(anyhow::anyhow!(err));
             }
 
-            let frames = String::from_utf8(frame_count.stdout)?
-                .trim()
-                .parse::<u64>()?;
-            total_frames += frames;
+            total_frames += frame_count;
 
             segment_paths.push(segment_path);
         }
@@ -301,18 +246,7 @@ impl SegmentManager {
 
     pub async fn detect_format(file_path: &str) -> Result<String> {
         info!("Attempting format detection for: {}", file_path);
-
-        let path = Path::new(file_path);
-        let absolute_path = if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            // Check if path already includes the uploads directory
-            if path.to_str().unwrap_or("").contains("uploads") {
-                PathBuf::from(path)
-            } else {
-                PathBuf::from("work/server/uploads").join(path)
-            }
-        };
+        let absolute_path = ensure_absolute_path(file_path, Some("work/server/uploads"));
 
         if !absolute_path.exists() {
             return Err(anyhow::anyhow!(
@@ -321,53 +255,7 @@ impl SegmentManager {
             ));
         }
 
-        let output = match tokio::process::Command::new("ffprobe")
-            .args([
-                "-v",
-                "error",
-                "-select_streams",
-                "v:0",
-                "-show_entries",
-                "stream=codec_name",
-                "-of",
-                "default=noprint_wrappers=1:nokey=1",
-                absolute_path.to_str().unwrap_or(""),
-            ])
-            .output()
-            .await
-        {
-            Ok(output) => {
-                info!("FFprobe command executed. Status: {:?}", output.status);
-                if !output.status.success() {
-                    error!(
-                        "FFprobe stderr: {}",
-                        String::from_utf8_lossy(&output.stderr)
-                    );
-                }
-                output
-            }
-            Err(e) => {
-                error!("Failed to execute ffprobe: {}", e);
-                error!("FFprobe path: {:?}", which::which("ffprobe"));
-                return Err(e.into());
-            }
-        };
-
-        if !output.status.success() {
-            error!(
-                "FFprobe failed with status {}. Stderr: {}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr)
-            );
-            return Err(anyhow::anyhow!(
-                "FFprobe failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            ));
-        }
-
-        let format = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        info!("Format detection successful. Detected format: {}", format);
-        Ok(format)
+        FfProbeService::detect_format(absolute_path.to_str().unwrap()).await
     }
     pub fn get_output_format(input_format: &str) -> (&'static str, Vec<&'static str>) {
         // Split by comma and take first format
@@ -593,31 +481,8 @@ impl SegmentManager {
         let temp_path = temp_dir.join(format!("verify_{}.tmp", Uuid::new_v4()));
         tokio::fs::write(&temp_path, segment_data).await?;
 
-        let frame_count = Command::new("ffprobe")
-            .args([
-                "-v",
-                "error",
-                "-select_streams",
-                "v:0",
-                "-count_packets",
-                "-show_entries",
-                "stream=nb_read_packets",
-                "-of",
-                "csv=p=0",
-                temp_path.to_str().unwrap(),
-            ])
-            .output()
-            .await?;
+        let count = FfProbeService::count_frames(temp_path.to_str().unwrap()).await?;
 
-        if !frame_count.status.success() {
-            anyhow::bail!("Failed to verify segment frame count");
-        }
-
-        let count = String::from_utf8(frame_count.stdout)?
-            .trim()
-            .parse::<u64>()?;
-
-        // Clean up temporary file
         if let Err(e) = tokio::fs::remove_file(&temp_path).await {
             warn!("Failed to remove temporary verify file: {}", e);
         }
