@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use tokio::process::Command;
 use tracing::{error, info, warn};
 use uuid::Uuid;
+use which;
 
 #[derive(Debug)]
 pub struct SegmentData {
@@ -296,8 +297,63 @@ impl SegmentManager {
         &self.work_dir
     }
 
-    pub async fn detect_format(file_path: &str) -> Result<String> {
-        FfmpegService::detect_format(file_path).await
+    pub async fn detect_format(path: &str) -> Result<String, std::io::Error> {
+        info!("Attempting to detect format using ffmpeg...");
+
+        let ffmpeg_cmd = format!("ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of default=noprint_wrappers=1:nokey=1 {}", path);
+        info!("Executing command: {}", ffmpeg_cmd);
+
+        let output = match tokio::process::Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=codec_name",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                path,
+            ])
+            .output()
+            .await
+        {
+            Ok(output) => {
+                info!("FFprobe command executed. Status: {:?}", output.status);
+                if !output.status.success() {
+                    error!(
+                        "FFprobe stderr: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+                output
+            }
+            Err(e) => {
+                error!("Failed to execute ffprobe: {}", e);
+                error!("FFprobe path: {:?}", which::which("ffprobe"));
+                return Err(e);
+            }
+        };
+
+        if !output.status.success() {
+            error!(
+                "FFprobe failed with status {}. Stderr: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!(
+                    "FFprobe failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                ),
+            ));
+        }
+
+        let format = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+        info!("Format detection successful. Detected format: {}", format);
+        Ok(format)
     }
 
     pub fn get_output_format(input_format: &str) -> (&'static str, Vec<&'static str>) {
