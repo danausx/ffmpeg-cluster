@@ -84,7 +84,7 @@ async fn connect_to_server(
     // Configure WebSocket settings
     let mut config = WebSocketConfig::default();
     config.max_message_size = Some(1024 * 1024 * 1024); // 1GB
-    config.max_frame_size = Some(64 * 1024 * 1024); // 64MB
+    config.max_frame_size = Some(1024 * 1024 * 1024); // 1GB
 
     let (ws_stream, _) = connect_async_with_config(&ws_url, Some(config), false).await?;
 
