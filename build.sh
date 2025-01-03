@@ -23,6 +23,17 @@ set_environment() {
     fi
 }
 
+show_usage() {
+    echo "Usage: $0 [--test]"
+    echo "  --test    Test mode - skips git operations and GitHub release"
+}
+
+clean_release_dir() {
+    print_color "BLUE" "Cleaning release directory..."
+    rm -rf "$RELEASE_DIR"/*
+    mkdir -p "$RELEASE_DIR"
+}
+
 # Function to print in color
 print_color() {
     printf "${!1}%s${NC}\n" "$2"
@@ -194,7 +205,6 @@ RELEASE_DIR="release"
 setup_build_dirs() {
     mkdir -p "$CACHE_DIR/ffmpeg"
     mkdir -p "$TEMP_DIR"
-    mkdir -p "$BUILD_DIR/client/bin"
     mkdir -p "$BUILD_DIR/server"
     mkdir -p "$RELEASE_DIR"
 }
@@ -204,11 +214,9 @@ download_ffmpeg() {
     # Convert to absolute paths
     local ffmpeg_cache_dir="$(pwd)/$CACHE_DIR/ffmpeg/$os"
     local temp_dir="$(pwd)/$TEMP_DIR/$os"
-    local client_bin_dir="$(pwd)/$BUILD_DIR/client/bin"
 
     mkdir -p "$ffmpeg_cache_dir"
     mkdir -p "$temp_dir"
-    mkdir -p "$client_bin_dir"
 
     print_color "BLUE" "Setting up directories for FFmpeg ($os)..."
 
@@ -216,17 +224,11 @@ download_ffmpeg() {
     if [[ $os == windows* ]]; then
         if [ -f "$ffmpeg_cache_dir/ffmpeg.exe" ] && [ -f "$ffmpeg_cache_dir/ffprobe.exe" ]; then
             print_color "GREEN" "Using cached FFmpeg for $os"
-            cp "$ffmpeg_cache_dir/ffmpeg.exe" "$client_bin_dir/"
-            cp "$ffmpeg_cache_dir/ffprobe.exe" "$client_bin_dir/"
             return
         fi
     else
         if [ -f "$ffmpeg_cache_dir/ffmpeg" ] && [ -f "$ffmpeg_cache_dir/ffprobe" ]; then
             print_color "GREEN" "Using cached FFmpeg for $os"
-            cp "$ffmpeg_cache_dir/ffmpeg" "$client_bin_dir/"
-            cp "$ffmpeg_cache_dir/ffprobe" "$client_bin_dir/"
-            chmod +x "$client_bin_dir/ffmpeg"
-            chmod +x "$client_bin_dir/ffprobe"
             return
         fi
     fi
@@ -244,10 +246,6 @@ download_ffmpeg() {
         unzip -o ffprobe.zip
         cp ffmpeg "$ffmpeg_cache_dir/"
         cp ffprobe "$ffmpeg_cache_dir/"
-        cp "$ffmpeg_cache_dir/ffmpeg" "$client_bin_dir/"
-        cp "$ffmpeg_cache_dir/ffprobe" "$client_bin_dir/"
-        chmod +x "$client_bin_dir/ffmpeg"
-        chmod +x "$client_bin_dir/ffprobe"
         rm -f ffmpeg.zip ffprobe.zip
         ;;
     "linux-x86_64" | "linux-aarch64")
@@ -267,10 +265,6 @@ download_ffmpeg() {
 
         cp "$ffmpeg_dir/ffmpeg" "$ffmpeg_cache_dir/"
         cp "$ffmpeg_dir/ffprobe" "$ffmpeg_cache_dir/"
-        cp "$ffmpeg_cache_dir/ffmpeg" "$client_bin_dir/"
-        cp "$ffmpeg_cache_dir/ffprobe" "$client_bin_dir/"
-        chmod +x "$client_bin_dir/ffmpeg"
-        chmod +x "$client_bin_dir/ffprobe"
         rm -rf "$ffmpeg_dir" ffmpeg.tar.xz
         ;;
     "windows-x86_64")
@@ -278,8 +272,6 @@ download_ffmpeg() {
         unzip -o ffmpeg.zip
         cp "ffmpeg-master-latest-win64-gpl/bin/ffmpeg.exe" "$ffmpeg_cache_dir/"
         cp "ffmpeg-master-latest-win64-gpl/bin/ffprobe.exe" "$ffmpeg_cache_dir/"
-        cp "$ffmpeg_cache_dir/ffmpeg.exe" "$client_bin_dir/"
-        cp "$ffmpeg_cache_dir/ffprobe.exe" "$client_bin_dir/"
         rm -rf ffmpeg-master-latest-win64-gpl ffmpeg.zip
         ;;
     esac
@@ -310,39 +302,63 @@ build_component() {
         ;;
     esac
 
-    mkdir -p "$BUILD_DIR/$component"
+    # Create unique temp directory for this target
+    local target_temp_dir="$BUILD_DIR/temp/$target"
+    mkdir -p "$target_temp_dir"
 
-    local build_cmd
-    if [[ "$target" == "$NATIVE_TARGET" ]]; then
-        build_cmd="cargo build --release -p $package_name"
-    elif [[ "$target" == linux* ]] || [ "$target" = "windows-x86_64" ]; then
-        build_cmd="cross build --release --target $rust_target -p $package_name"
-    else
-        build_cmd="cargo build --release --target $rust_target -p $package_name"
-    fi
-
-    if ! $build_cmd; then
-        print_color "RED" "Failed to build $component"
-        exit 1
-    fi
-
-    if [[ $target == windows* ]]; then
-        if [[ "$target" == "$NATIVE_TARGET" ]]; then
-            cp "target/release/$package_name.exe" "$BUILD_DIR/$component/"
-        else
-            cp "target/$rust_target/release/$package_name.exe" "$BUILD_DIR/$component/"
+    # Build
+    if [[ $target == macos* ]]; then
+        # For macOS, always use native build
+        print_color "BLUE" "Building natively for macOS..."
+        if ! cargo build --release -p $package_name; then
+            print_color "RED" "Failed to build $component"
+            exit 1
         fi
-    else
-        if [[ "$target" == "$NATIVE_TARGET" ]]; then
-            cp "target/release/$package_name" "$BUILD_DIR/$component/"
-            chmod +x "$BUILD_DIR/$component/$package_name"
-        else
-            cp "target/$rust_target/release/$package_name" "$BUILD_DIR/$component/"
-            chmod +x "$BUILD_DIR/$component/$package_name"
+
+        # Copy from native release directory
+        cp "target/release/$package_name" "$target_temp_dir/" || {
+            print_color "RED" "Failed to copy macOS executable"
+            ls -la "target/release/"
+            exit 1
+        }
+        chmod +x "$target_temp_dir/$package_name"
+        print_color "GREEN" "Saved macOS executable to: $target_temp_dir/$package_name"
+
+    elif [[ $target == windows* ]]; then
+        # Windows needs cross
+        print_color "BLUE" "Cross-compiling for Windows..."
+        if ! cross build --release --target $rust_target -p $package_name; then
+            print_color "RED" "Failed to build $component"
+            exit 1
         fi
+
+        cp "target/$rust_target/release/$package_name.exe" "$target_temp_dir/" || {
+            print_color "RED" "Failed to copy Windows executable"
+            ls -la "target/$rust_target/release/"
+            exit 1
+        }
+        print_color "GREEN" "Saved Windows executable to: $target_temp_dir/$package_name.exe"
+
+    elif [[ $target == linux* ]]; then
+        # Linux needs cross
+        print_color "BLUE" "Cross-compiling for Linux..."
+        if ! cross build --release --target $rust_target -p $package_name; then
+            print_color "RED" "Failed to build $component"
+            exit 1
+        fi
+
+        cp "target/$rust_target/release/$package_name" "$target_temp_dir/" || {
+            print_color "RED" "Failed to copy Linux executable"
+            ls -la "target/$rust_target/release/"
+            exit 1
+        }
+        chmod +x "$target_temp_dir/$package_name"
+        print_color "GREEN" "Saved Linux executable to: $target_temp_dir/$package_name"
     fi
+
+    print_color "BLUE" "Build artifacts in temp directory:"
+    ls -la "$target_temp_dir"
 }
-
 # Function to create the release package
 create_release_package() {
     local target=$1
@@ -355,16 +371,228 @@ create_release_package() {
     mkdir -p "$temp_release_dir/bin"
     mkdir -p "$temp_release_dir/samples"
 
-    # Copy test video if it exists
-    if [ -f "test.mp4" ]; then
-        print_color "BLUE" "Including test video sample..."
-        cp "test.mp4" "$temp_release_dir/samples/"
+    # Copy test video with better error handling and logging
+    print_color "BLUE" "Looking for test video in: $base_dir/test.mp4"
+    if [ -f "$base_dir/test.mp4" ]; then
+        print_color "BLUE" "Found test.mp4, copying to samples directory..."
+        cp "$base_dir/test.mp4" "$temp_release_dir/samples/" || {
+            print_color "RED" "Failed to copy test.mp4"
+            return 1
+        }
+        print_color "GREEN" "Successfully copied test.mp4 to samples directory"
     else
-        print_color "YELLOW" "Warning: test.mp4 not found in project root"
+        print_color "YELLOW" "Warning: test.mp4 not found in: $base_dir"
+        ls -la "$base_dir" | grep "test.mp4" || true
     fi
 
-    # Rest of the existing function code...
-    # (keep the existing copy_ffmpeg_binaries and component selection logic)
+    # Helper function to copy FFmpeg binaries
+    copy_ffmpeg_binaries() {
+        local dest_dir="$1"
+        local ffmpeg_cache_dir="$base_dir/$CACHE_DIR/ffmpeg/$target"
+
+        if [[ $target == windows* ]]; then
+            cp "$ffmpeg_cache_dir/ffmpeg.exe" "$dest_dir/"
+            cp "$ffmpeg_cache_dir/ffprobe.exe" "$dest_dir/"
+        else
+            cp "$ffmpeg_cache_dir/ffmpeg" "$dest_dir/"
+            cp "$ffmpeg_cache_dir/ffprobe" "$dest_dir/"
+            chmod +x "$dest_dir/ffmpeg"
+            chmod +x "$dest_dir/ffprobe"
+        fi
+    }
+
+    # Function to find the correct executable path
+    get_executable_path() {
+        local component=$1
+        local exe_name="ffmpeg-cluster-$component"
+        local possible_paths=()
+
+        # Always check temp directory first
+        local target_temp_dir="$base_dir/$BUILD_DIR/temp/$target"
+
+        if [[ $target == windows* ]]; then
+            exe_name="${exe_name}.exe"
+            possible_paths=(
+                "$target_temp_dir/$exe_name"
+                "$base_dir/target/x86_64-pc-windows-gnu/release/$exe_name"
+                "$base_dir/target/release/$exe_name"
+            )
+        elif [[ $target == linux* ]]; then
+            possible_paths=(
+                "$target_temp_dir/$exe_name"
+                "$base_dir/target/x86_64-unknown-linux-gnu/release/$exe_name"
+                "$base_dir/target/release/$exe_name"
+            )
+        else
+            possible_paths=(
+                "$target_temp_dir/$exe_name"
+                "$base_dir/target/release/$exe_name"
+            )
+        fi
+
+        for path in "${possible_paths[@]}"; do
+            if [ -f "$path" ]; then
+                echo "$path"
+                return 0
+            fi
+        done
+
+        print_color "RED" "Executable not found in any of these locations:"
+        for path in "${possible_paths[@]}"; do
+            echo " - $path"
+        done
+        return 1
+    }
+
+    case $selected_component in
+    0) # Both client and server
+        if [[ $target == windows* ]]; then
+            print_color "BLUE" "Copying Windows executables to release..."
+
+            # Get client executable path
+            local client_exe=$(get_executable_path "client")
+            local server_exe=$(get_executable_path "server")
+
+            if [ -z "$client_exe" ] || [ -z "$server_exe" ]; then
+                exit 1
+            fi
+
+            if ! cp "$client_exe" "$temp_release_dir/ffmpeg-cluster-client.exe"; then
+                print_color "RED" "Failed to copy Windows client executable"
+                exit 1
+            fi
+            if ! cp "$server_exe" "$temp_release_dir/ffmpeg-cluster-server.exe"; then
+                print_color "RED" "Failed to copy Windows server executable"
+                exit 1
+            fi
+            copy_ffmpeg_binaries "$temp_release_dir/bin"
+
+        elif [[ $target == linux* ]]; then
+            print_color "BLUE" "Copying Linux executables to release..."
+
+            # Get client executable path
+            local client_exe=$(get_executable_path "client")
+            local server_exe=$(get_executable_path "server")
+
+            if [ -z "$client_exe" ] || [ -z "$server_exe" ]; then
+                exit 1
+            fi
+
+            if ! cp "$client_exe" "$temp_release_dir/ffmpeg-cluster-client"; then
+                print_color "RED" "Failed to copy Linux client executable"
+                exit 1
+            fi
+            if ! cp "$server_exe" "$temp_release_dir/ffmpeg-cluster-server"; then
+                print_color "RED" "Failed to copy Linux server executable"
+                exit 1
+            fi
+            chmod +x "$temp_release_dir/ffmpeg-cluster-client"
+            chmod +x "$temp_release_dir/ffmpeg-cluster-server"
+            copy_ffmpeg_binaries "$temp_release_dir/bin"
+
+        else
+            cp "$base_dir/$BUILD_DIR/client/ffmpeg-cluster-client" "$temp_release_dir/"
+            cp "$base_dir/$BUILD_DIR/server/ffmpeg-cluster-server" "$temp_release_dir/"
+            chmod +x "$temp_release_dir/ffmpeg-cluster-client"
+            chmod +x "$temp_release_dir/ffmpeg-cluster-server"
+            copy_ffmpeg_binaries "$temp_release_dir/bin"
+        fi
+        ;;
+
+    1) # Client only
+        if [[ $target == macos* ]]; then
+            print_color "BLUE" "Copying macOS client executable to release..."
+
+            # First check temp directory
+            local exe_source="$base_dir/$BUILD_DIR/temp/$target/ffmpeg-cluster-client"
+            if [ ! -f "$exe_source" ]; then
+                # Fallback to direct release directory
+                exe_source="$base_dir/target/release/ffmpeg-cluster-client"
+            fi
+
+            print_color "BLUE" "Looking for macOS executable at: $exe_source"
+            if [ ! -f "$exe_source" ]; then
+                print_color "RED" "macOS executable not found at expected location"
+                ls -la "$base_dir/target/release/"
+                exit 1
+            fi
+
+            if ! cp "$exe_source" "$temp_release_dir/ffmpeg-cluster-client"; then
+                print_color "RED" "Failed to copy macOS executable"
+                exit 1
+            fi
+            chmod +x "$temp_release_dir/ffmpeg-cluster-client"
+            copy_ffmpeg_binaries "$temp_release_dir/bin"
+        fi
+        if [[ $target == windows* ]]; then
+            print_color "BLUE" "Copying Windows client executable to release..."
+
+            local exe_source=$(get_executable_path "client")
+            if [ -z "$exe_source" ]; then
+                exit 1
+            fi
+
+            if ! cp "$exe_source" "$temp_release_dir/ffmpeg-cluster-client.exe"; then
+                print_color "RED" "Failed to copy Windows client executable"
+                exit 1
+            fi
+            copy_ffmpeg_binaries "$temp_release_dir/bin"
+
+        elif [[ $target == linux* ]]; then
+            print_color "BLUE" "Copying Linux client executable to release..."
+
+            local exe_source=$(get_executable_path "client")
+            if [ -z "$exe_source" ]; then
+                exit 1
+            fi
+
+            if ! cp "$exe_source" "$temp_release_dir/ffmpeg-cluster-client"; then
+                print_color "RED" "Failed to copy Linux client executable"
+                exit 1
+            fi
+            chmod +x "$temp_release_dir/ffmpeg-cluster-client"
+            copy_ffmpeg_binaries "$temp_release_dir/bin"
+
+        else
+            cp "$base_dir/$BUILD_DIR/client/ffmpeg-cluster-client" "$temp_release_dir/"
+            chmod +x "$temp_release_dir/ffmpeg-cluster-client"
+            copy_ffmpeg_binaries "$temp_release_dir/bin"
+        fi
+        ;;
+
+    2) # Server only
+        if [[ $target == windows* ]]; then
+            print_color "BLUE" "Copying Windows server executable to release..."
+
+            local exe_source=$(get_executable_path "server")
+            if [ -z "$exe_source" ]; then
+                exit 1
+            fi
+
+            if ! cp "$exe_source" "$temp_release_dir/ffmpeg-cluster-server.exe"; then
+                print_color "RED" "Failed to copy Windows server executable"
+                exit 1
+            fi
+
+        elif [[ $target == linux* ]]; then
+            print_color "BLUE" "Copying Linux server executable to release..."
+
+            local exe_source=$(get_executable_path "server")
+            if [ -z "$exe_source" ]; then
+                exit 1
+            fi
+
+            if ! cp "$exe_source" "$temp_release_dir/ffmpeg-cluster-server"; then
+                print_color "RED" "Failed to copy Linux server executable"
+                exit 1
+            fi
+            chmod +x "$temp_release_dir/ffmpeg-cluster-server"
+        else
+            cp "$base_dir/$BUILD_DIR/server/ffmpeg-cluster-server" "$temp_release_dir/"
+            chmod +x "$temp_release_dir/ffmpeg-cluster-server"
+        fi
+        ;;
+    esac
 
     mkdir -p "$base_dir/$RELEASE_DIR"
 
@@ -376,7 +604,6 @@ create_release_package() {
         }
     elif [[ $target == macos* ]]; then
         print_color "BLUE" "Creating macOS archive..."
-        # Using ditto for better macOS compatibility
         if command -v ditto >/dev/null 2>&1; then
             (cd "$temp_release_dir" && ditto -c -k --sequesterRsrc --keepParent . "$base_dir/$RELEASE_DIR/ffmpeg-cluster-$target.zip") || {
                 print_color "RED" "Failed to create ZIP archive with ditto"
@@ -415,42 +642,48 @@ create_release_package() {
 # Function to prompt for input
 input() {
     echo ""
-    valid_commit=0
-    while [[ $valid_commit -eq 0 ]]; do
-        print_color "BLUE" "> Enter commit message"
-        echo ""
-        read commit_message
-        if [[ -z "$commit_message" ]]; then
-            print_color "RED" "Commit message cannot be empty."
-        else
-            valid_commit=1
-        fi
-    done
+    if [ $TEST_MODE -eq 0 ]; then
+        valid_commit=0
+        while [[ $valid_commit -eq 0 ]]; do
+            print_color "BLUE" "> Enter commit message"
+            echo ""
+            read commit_message
+            if [[ -z "$commit_message" ]]; then
+                print_color "RED" "Commit message cannot be empty."
+            else
+                valid_commit=1
+            fi
+        done
 
-    echo ""
-    valid_version=0
-    while [[ $valid_version -eq 0 ]]; do
-        print_color "BLUE" "> Enter version"
         echo ""
-        read version
-        if [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            valid_version=1
-        else
-            print_color "RED" "Version must be in semantic versioning format (X.Y.Z). Please try again."
-        fi
-    done
+        valid_version=0
+        while [[ $valid_version -eq 0 ]]; do
+            print_color "BLUE" "> Enter version"
+            echo ""
+            read version
+            if [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                valid_version=1
+            else
+                print_color "RED" "Version must be in semantic versioning format (X.Y.Z). Please try again."
+            fi
+        done
 
-    # Update version in Cargo.toml files
-    if [[ "$(uname)" == "Darwin" ]]; then
-        # Update all Cargo.toml files including the root one
-        sed -i '' "s/^version = \".*\"/version = \"$version\"/" Cargo.toml */Cargo.toml
-        [ -f .env ] && sed -i '' "s/^VERSION=.*/VERSION=$version/" .env
+        # Update version in Cargo.toml files only in non-test mode
+        if [[ "$(uname)" == "Darwin" ]]; then
+            # Update all Cargo.toml files including the root one
+            sed -i '' "s/^version = \".*\"/version = \"$version\"/" Cargo.toml */Cargo.toml
+            [ -f .env ] && sed -i '' "s/^VERSION=.*/VERSION=$version/" .env
+        else
+            sed -i "s/^version = \".*\"/version = \"$version\"/" Cargo.toml */Cargo.toml
+            [ -f .env ] && sed -i "s/^VERSION=.*/VERSION=$version/" .env
+        fi
+
+        set_environment
     else
-        sed -i "s/^version = \".*\"/version = \"$version\"/" Cargo.toml */Cargo.toml
-        [ -f .env ] && sed -i "s/^VERSION=.*/VERSION=$version/" .env
+        commit_message="Test release"
+        version="0.0.0-test"
+        print_color "YELLOW" "Test mode: Using default values (no Cargo.toml updates)"
     fi
-
-    set_environment
 }
 
 # Function to tag and push to git
@@ -481,12 +714,37 @@ create_github_release() {
 }
 
 # Main function
+# Main function
 main() {
+    # Handle parameters
+    TEST_MODE=0
+    while [[ "$#" -gt 0 ]]; do
+        case $1 in
+        --test)
+            TEST_MODE=1
+            print_color "YELLOW" "Test mode: Will skip all git operations and version updates"
+            commit_message="Test release"
+            version="0.0.0-test"
+            ;;
+        --help | -h)
+            show_usage
+            exit 0
+            ;;
+        *)
+            print_color "RED" "Unknown parameter: $1"
+            show_usage
+            exit 1
+            ;;
+        esac
+        shift
+    done
+
     start_task "Process"
 
     set_environment
     check_requirements
     setup_build_dirs
+    clean_release_dir
 
     # Initial action selection
     print_menu_header "Action Selection"
@@ -499,36 +757,61 @@ main() {
     case $action_choice in
     "2") # Release workflow
         print_color "BLUE" "Starting release process..."
-        input # Get version and commit message
+        if [ $TEST_MODE -eq 0 ]; then
+            input
+        fi
+
+        # Track successful builds
+        local successful_builds=()
 
         # Build for macOS x86_64
         NATIVE_TARGET="macos-x86_64"
         NATIVE_RUST_TARGET="x86_64-apple-darwin"
         print_color "BLUE" "Building for macOS (x86_64)..."
-        download_ffmpeg "$NATIVE_TARGET"
-        build_component "client" "$NATIVE_TARGET" "$NATIVE_RUST_TARGET"
-        create_release_package "$NATIVE_TARGET" "1"
+        if download_ffmpeg "$NATIVE_TARGET" &&
+            build_component "client" "$NATIVE_TARGET" "$NATIVE_RUST_TARGET" &&
+            create_release_package "$NATIVE_TARGET" "1"; then
+            successful_builds+=("macOS x86_64")
+            print_color "GREEN" "Successfully built for macOS x86_64"
+        else
+            print_color "YELLOW" "Skipping macOS x86_64 due to build failure"
+        fi
 
         # Build for Windows x86_64
         NATIVE_TARGET="windows-x86_64"
         NATIVE_RUST_TARGET="x86_64-pc-windows-gnu"
         print_color "BLUE" "Building for Windows (x86_64)..."
-        download_ffmpeg "$NATIVE_TARGET"
-        build_component "client" "$NATIVE_TARGET" "$NATIVE_RUST_TARGET"
-        create_release_package "$NATIVE_TARGET" "1"
+        if download_ffmpeg "$NATIVE_TARGET" &&
+            build_component "client" "$NATIVE_TARGET" "$NATIVE_RUST_TARGET" &&
+            create_release_package "$NATIVE_TARGET" "1"; then
+            successful_builds+=("Windows x86_64")
+            print_color "GREEN" "Successfully built for Windows x86_64"
+        else
+            print_color "YELLOW" "Skipping Windows x86_64 due to build failure"
+        fi
 
         # Build for Linux x86_64
         NATIVE_TARGET="linux-x86_64"
         NATIVE_RUST_TARGET="x86_64-unknown-linux-gnu"
         print_color "BLUE" "Building for Linux (x86_64)..."
-        download_ffmpeg "$NATIVE_TARGET"
-        build_component "client" "$NATIVE_TARGET" "$NATIVE_RUST_TARGET"
-        create_release_package "$NATIVE_TARGET" "1"
+        if download_ffmpeg "$NATIVE_TARGET" &&
+            build_component "client" "$NATIVE_TARGET" "$NATIVE_RUST_TARGET" &&
+            create_release_package "$NATIVE_TARGET" "1"; then
+            successful_builds+=("Linux x86_64")
+            print_color "GREEN" "Successfully built for Linux x86_64"
+        else
+            print_color "YELLOW" "Skipping Linux x86_64 due to build failure"
+        fi
 
-        # Create GitHub release
-        if [ $? -eq 0 ]; then
-            tag_and_push
-            create_github_release
+        if [ ${#successful_builds[@]} -eq 0 ]; then
+            print_color "RED" "No platforms were built successfully"
+            exit 1
+        else
+            print_color "GREEN" "Successfully built for: ${successful_builds[*]}"
+            if [ $TEST_MODE -eq 0 ]; then
+                tag_and_push
+                create_github_release
+            fi
         fi
         ;;
 
@@ -612,27 +895,42 @@ main() {
             ;;
         esac
 
-        # Get version and commit message
-        input
+        if [ $TEST_MODE -eq 0 ]; then
+            input
+        fi
 
-        # Download FFmpeg and build
-        download_ffmpeg "$target"
+        # Download FFmpeg and build with error handling
+        if ! download_ffmpeg "$target"; then
+            print_color "RED" "Failed to download FFmpeg for $target"
+            exit 1
+        fi
+
         case $selected_component in
         "1")
-            build_component "client" "$target" "$rust_target"
+            if ! build_component "client" "$target" "$rust_target" ||
+                ! create_release_package "$target" "1"; then
+                print_color "RED" "Failed to build client for $target"
+                exit 1
+            fi
             ;;
         "2")
-            build_component "server" "$target" "$rust_target"
+            if ! build_component "server" "$target" "$rust_target" ||
+                ! create_release_package "$target" "2"; then
+                print_color "RED" "Failed to build server for $target"
+                exit 1
+            fi
             ;;
         "0")
-            build_component "client" "$target" "$rust_target"
-            build_component "server" "$target" "$rust_target"
+            if ! build_component "client" "$target" "$rust_target" ||
+                ! build_component "server" "$target" "$rust_target" ||
+                ! create_release_package "$target" "0"; then
+                print_color "RED" "Failed to build components for $target"
+                exit 1
+            fi
             ;;
         esac
 
-        create_release_package "$target" "$selected_component"
-
-        if [ $? -eq 0 ]; then
+        if [ $TEST_MODE -eq 0 ] && [ $? -eq 0 ]; then
             tag_and_push
             create_github_release
         fi
@@ -641,5 +939,4 @@ main() {
 
     end_task
 }
-
 main "$@"

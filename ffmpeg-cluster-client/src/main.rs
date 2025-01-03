@@ -389,7 +389,7 @@ async fn upload_file(
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize storage manager
     let storage = StorageManager::new().await?;
-    let client_id = storage.get_id().to_string();
+    let _client_id = storage.get_id().to_string();
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
         .with_target(false)
