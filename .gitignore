@@ -104,3 +104,5 @@ uploads/
 release/
 Cargo.lock
 .github/dependabot.yml
+ffprobe
+ffmpeg

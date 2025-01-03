@@ -12,6 +12,7 @@ FFmpeg Cluster is a distributed video processing system built in Rust that lever
   - AMD AMF
   - Apple VideoToolbox
   - Intel/AMD VAAPI on Linux
+
 - **Intelligent Load Balancing**: Dynamic workload distribution based on client performance
 - **Frame-Accurate Processing**: Precise frame handling during splitting and recombination
 - **Automatic Recovery**: Built-in retry mechanisms and error handling
@@ -52,7 +53,7 @@ The project consists of three main Rust components:
 - Docker (for cross-compilation)
 - curl and unzip (for FFmpeg download)
 
-FFmpeg is automatically downloaded and managed by the client.
+FFmpeg and FFprobe are automatically downloaded and managed by the build procedure.
 
 ## Building
 
@@ -134,7 +135,6 @@ The project includes a comprehensive build script (`build.sh`) that handles:
   --benchmark-duration 10 \
   --reconnect-delay 3 \
   --persistent true \
-  --participate true
 ```
 
 ### Client Options
@@ -167,7 +167,7 @@ The project includes a comprehensive build script (`build.sh`) that handles:
 # Process local file on server
 curl -X POST http://localhost:5001/ws/command \
   -H "Content-Type: application/json" \
-  -d '{"ProcessLocalFile":{"file_path":"input.mp4"}}'
+  -d '{"ProcessLocalFile":{"file_path":"test1.mp4"}}'
 ```
 
 ## Job Management
