@@ -64,45 +64,6 @@ async fn handle_socket(
         };
         let msg_str = serde_json::to_string(&msg)?;
         sender.send(Message::Text(msg_str.into())).await?;
-
-        // If we have enough clients, start benchmark phase
-        if current_clients >= required_clients {
-            let benchmark_data = {
-                let state = state_arc.lock().await;
-                if let Some(input_file) = state.current_input.as_ref() {
-                    match state
-                        .segment_manager
-                        .create_benchmark_sample(input_file, state.config.benchmark_seconds)
-                        .await
-                    {
-                        Ok(sample) => Some((
-                            sample.data,
-                            sample.format,
-                            state.config.ffmpeg_params.clone(),
-                        )),
-                        Err(e) => {
-                            error!("Failed to create benchmark sample: {}", e);
-                            None
-                        }
-                    }
-                } else {
-                    None
-                }
-            };
-
-            if let Some((data, format, params)) = benchmark_data {
-                let benchmark_msg = ServerMessage::BenchmarkRequest {
-                    data,
-                    format,
-                    params: params.split_whitespace().map(String::from).collect(),
-                    job_id: job_id.clone(),
-                };
-
-                if let Ok(msg_str) = serde_json::to_string(&benchmark_msg) {
-                    sender.send(Message::Text(msg_str.into())).await?;
-                }
-            }
-        }
     } else {
         let msg = ServerMessage::ClientIdle {
             id: client_id.clone(),
@@ -202,39 +163,12 @@ async fn handle_socket(
                                                     break;
                                                 }
                                             }
-
-                                            // Check if we need to start benchmark
-                                            let state = state_arc.lock().await;
-                                            if state.clients.len() >= state.config.required_clients {
-                                                if let Some(input_file) = state.current_input.as_ref() {
-                                                    match state
-                                                        .segment_manager
-                                                        .create_benchmark_sample(input_file, state.config.benchmark_seconds)
-                                                        .await
-                                                    {
-                                                        Ok(sample) => {
-                                                            let benchmark_msg = ServerMessage::BenchmarkRequest {
-                                                                data: sample.data,
-                                                                format: sample.format,
-                                                                params: state.config.ffmpeg_params
-                                                                    .split_whitespace()
-                                                                    .map(String::from)
-                                                                    .collect(),
-                                                                job_id,
-                                                            };
-
-                                                            if let Ok(msg_str) = serde_json::to_string(&benchmark_msg) {
-                                                                if let Err(e) = sender.send(Message::Text(msg_str.into())).await {
-                                                                    error!("Failed to send benchmark request: {}", e);
-                                                                    break;
-                                                                }
-                                                            }
-                                                        }
-                                                        Err(e) => {
-                                                            error!("Failed to create benchmark sample: {}", e);
-                                                        }
-                                                    }
-                                                }
+                                        }
+                                        ServerMessage::JobComplete { .. } => {
+                                            // Forward job completion message to client
+                                            if let Err(e) = sender.send(Message::Text(broadcast_msg.content.into())).await {
+                                                error!("Failed to forward job completion message: {}", e);
+                                                break;
                                             }
                                         }
                                         _ => {
@@ -606,43 +540,109 @@ async fn handle_all_segments_complete(
     state: &mut AppState,
     job_id: &str,
 ) -> Result<(), anyhow::Error> {
-    info!("Starting final segment combination...");
-    let output_file = state.config.file_name_output.clone();
+    info!("Starting final segment combination for job {}", job_id);
+    let output_file = format!("output_{}.mp4", job_id);
 
     match state.segment_manager.combine_segments(&output_file).await {
         Ok(_) => {
-            info!("Successfully combined segments into: {}", output_file);
-
-            // Verify the output file exists and has content
-            if let Ok(metadata) = tokio::fs::metadata(&output_file).await {
-                info!("Output file size: {} bytes", metadata.len());
-            }
-
-            // Mark job as completed
+            info!("Successfully completed job {}", job_id);
             state.job_queue.mark_job_completed(job_id);
-            info!("Marked job {} as completed", job_id);
 
-            // Reset state for next job
-            state.current_job = None;
-            state.segment_manager = SegmentManager::new(None);
-            if let Err(e) = state.segment_manager.init().await {
-                error!("Failed to initialize new segment manager: {}", e);
-                return Err(e.into());
-            }
+            // Reset client performance metrics and clear segments
+            state.clients.iter_mut().for_each(|(_, perf)| *perf = 0.0);
+            state.segment_manager.reset_state();
 
-            // Notify clients
-            let completion_msg = ServerMessage::JobComplete {
+            // Send job completion notification to all clients
+            let complete_msg = ServerMessage::JobComplete {
                 job_id: job_id.to_string(),
             };
 
-            if let Ok(msg_str) = serde_json::to_string(&completion_msg) {
+            if let Ok(msg_str) = serde_json::to_string(&complete_msg) {
                 let broadcast_msg = crate::ServerMessage {
                     target: None,
                     content: msg_str,
                 };
-
                 if let Err(e) = state.broadcast_tx.send(broadcast_msg) {
                     error!("Failed to broadcast job completion: {}", e);
+                }
+            }
+
+            // Get next job from queue if available
+            if let Some(next_job) = state.job_queue.get_next_job() {
+                let next_job_id = next_job.info.job_id.clone();
+                let next_file_path = next_job.file_path.to_string_lossy().to_string();
+
+                info!("Starting next job from queue: {}", next_job_id);
+                state.current_job = Some(next_job_id.clone());
+                state.current_input = Some(next_file_path.clone());
+
+                // Initialize segment manager for next job
+                state.segment_manager.set_job_id(next_job_id.clone());
+                if let Err(e) = state.segment_manager.init().await {
+                    error!("Failed to initialize segment manager for next job: {}", e);
+                    return Err(e);
+                }
+
+                // Send idle state to all clients
+                let idle_msg = ServerMessage::ClientIdle {
+                    id: "broadcast".to_string(),
+                };
+
+                if let Ok(msg_str) = serde_json::to_string(&idle_msg) {
+                    let broadcast_msg = crate::ServerMessage {
+                        target: None,
+                        content: msg_str,
+                    };
+                    if let Err(e) = state.broadcast_tx.send(broadcast_msg) {
+                        error!("Failed to broadcast idle state: {}", e);
+                    }
+                }
+
+                // Start benchmark for next job only after clients acknowledge idle state
+                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+                if let Some(input_file) = state.current_input.as_ref() {
+                    if let Ok(sample) = state
+                        .segment_manager
+                        .create_benchmark_sample(input_file, state.config.benchmark_seconds)
+                        .await
+                    {
+                        let benchmark_msg = ServerMessage::BenchmarkRequest {
+                            data: sample.data,
+                            format: sample.format,
+                            params: next_job.config.ffmpeg_params.clone(),
+                            job_id: next_job_id,
+                        };
+
+                        if let Ok(msg_str) = serde_json::to_string(&benchmark_msg) {
+                            let broadcast_msg = crate::ServerMessage {
+                                target: None,
+                                content: msg_str,
+                            };
+                            if let Err(e) = state.broadcast_tx.send(broadcast_msg) {
+                                error!("Failed to broadcast benchmark request for next job: {}", e);
+                            }
+                        }
+                    }
+                }
+            } else {
+                info!("No more jobs in queue");
+                state.current_job = None;
+                state.current_input = None;
+
+                // Send idle state to all clients
+                let idle_msg = ServerMessage::ClientIdle {
+                    id: "broadcast".to_string(),
+                };
+
+                if let Ok(msg_str) = serde_json::to_string(&idle_msg) {
+                    let broadcast_msg = crate::ServerMessage {
+                        target: None,
+                        content: msg_str,
+                    };
+                    if let Err(e) = state.broadcast_tx.send(broadcast_msg) {
+                        error!("Failed to broadcast idle state: {}", e);
+                    }
                 }
             }
 
@@ -650,8 +650,6 @@ async fn handle_all_segments_complete(
         }
         Err(e) => {
             error!("Failed to combine segments: {}", e);
-            state.job_queue.mark_job_failed(job_id, e.to_string());
-            state.current_job = None;
             Err(e.into())
         }
     }

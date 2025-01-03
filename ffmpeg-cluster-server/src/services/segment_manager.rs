@@ -23,6 +23,7 @@ pub struct SegmentManager {
     base_dir: PathBuf,
     work_dir: PathBuf,
     original_format: Option<String>,
+    detected_format: Option<String>,
     total_segments: usize,
 }
 
@@ -40,6 +41,7 @@ impl SegmentManager {
             base_dir,
             work_dir,
             original_format: None,
+            detected_format: None,
             total_segments: 0,
         }
     }
@@ -242,6 +244,7 @@ impl SegmentManager {
         );
         self.job_id = job_id;
         self.work_dir = self.base_dir.join(&self.job_id);
+        self.detected_format = None;
     }
 
     pub fn add_pending_segment(&mut self, segment_id: String) {
@@ -296,10 +299,10 @@ impl SegmentManager {
         &self.work_dir
     }
 
-    pub async fn detect_format(path: &str) -> Result<String, std::io::Error> {
-        info!("Attempting to detect format using ffmpeg...");
+    pub async fn detect_format(file_path: &str) -> Result<String> {
+        info!("Attempting format detection for: {}", file_path);
 
-        let path = Path::new(path);
+        let path = Path::new(file_path);
         let absolute_path = if path.is_absolute() {
             path.to_path_buf()
         } else {
@@ -312,16 +315,11 @@ impl SegmentManager {
         };
 
         if !absolute_path.exists() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("File not found: {}", absolute_path.display()),
+            return Err(anyhow::anyhow!(
+                "File not found: {}",
+                absolute_path.display()
             ));
         }
-
-        info!(
-            "Using absolute path for format detection: {}",
-            absolute_path.display()
-        );
 
         let output = match tokio::process::Command::new("ffprobe")
             .args([
@@ -351,7 +349,7 @@ impl SegmentManager {
             Err(e) => {
                 error!("Failed to execute ffprobe: {}", e);
                 error!("FFprobe path: {:?}", which::which("ffprobe"));
-                return Err(e);
+                return Err(e.into());
             }
         };
 
@@ -361,12 +359,9 @@ impl SegmentManager {
                 output.status,
                 String::from_utf8_lossy(&output.stderr)
             );
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!(
-                    "FFprobe failed: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                ),
+            return Err(anyhow::anyhow!(
+                "FFprobe failed: {}",
+                String::from_utf8_lossy(&output.stderr)
             ));
         }
 
@@ -401,7 +396,14 @@ impl SegmentManager {
         input_file: &str,
         duration: u32,
     ) -> Result<SegmentData> {
-        let format = Self::detect_format(input_file).await?;
+        let format = if let Some(fmt) = &self.original_format {
+            info!("Using cached format for benchmark sample: {}", fmt);
+            fmt.clone()
+        } else {
+            info!("No cached format found, detecting format for benchmark sample");
+            Self::detect_format(input_file).await?
+        };
+
         let (ext, format_opts) = Self::get_output_format(&format);
 
         let sample_id = format!("benchmark_{}", Uuid::new_v4());
@@ -453,10 +455,11 @@ impl SegmentManager {
         end_frame: u64,
     ) -> Result<SegmentData> {
         let format = if let Some(fmt) = &self.original_format {
+            info!("Using cached format for segment: {}", fmt);
             fmt.clone()
         } else {
-            let fmt = Self::detect_format(input_file).await?;
-            fmt
+            info!("No cached format found, detecting format for segment");
+            Self::detect_format(input_file).await?
         };
 
         // Get video stream info
@@ -675,5 +678,25 @@ impl SegmentManager {
     pub async fn stream_segment(data: &[u8], mut writer: impl std::io::Write) -> Result<()> {
         writer.write_all(data)?;
         Ok(())
+    }
+
+    pub async fn set_input_format(&mut self, input_file: &str) -> Result<String> {
+        if let Some(format) = &self.original_format {
+            info!("Using cached format: {}", format);
+            return Ok(format.clone());
+        }
+
+        let format = Self::detect_format(input_file).await?;
+        info!("Caching detected format: {}", format);
+        self.original_format = Some(format.clone());
+        Ok(format)
+    }
+    pub fn reset_state(&mut self) {
+        self.segments.clear();
+        self.pending_segments.clear();
+        self.completed_segments.clear();
+        self.total_segments = 0;
+        self.original_format = None;
+        self.detected_format = None;
     }
 }

@@ -9,7 +9,7 @@ use tokio_tungstenite::{
     tungstenite::protocol::{Message, WebSocketConfig},
     MaybeTlsStream, WebSocketStream,
 };
-use tracing::{error, info};
+use tracing::{error, info, warn};
 mod ffmpeg;
 mod services;
 use ffmpeg::FfmpegProcessor;
@@ -137,7 +137,11 @@ async fn handle_connection(
                             }
                         }
 
-                        state.set_job_id(&job_id); // Use new method to set job_id
+                        // Reset state before starting new job if it's different
+                        if state.job_id.as_ref() != Some(&job_id) {
+                            state.reset_job_state();
+                        }
+                        state.set_job_id(&job_id);
                     }
                     ServerMessage::ClientIdle { id } => {
                         info!("Received idle state with client ID: {}", id);
@@ -148,7 +152,10 @@ async fn handle_connection(
                                 state.processor = Some(proc);
                             }
                         }
-                        state.reset_job_state(); // Reset state when idle
+                        // Always clear all state when going idle
+                        state.reset_job_state();
+                        state.benchmark_completed = false;
+                        state.current_segment = None;
                     }
                     ServerMessage::BenchmarkRequest {
                         data,
@@ -156,8 +163,12 @@ async fn handle_connection(
                         params,
                         job_id,
                     } => {
-                        // Update job ID if it's different
-                        state.set_job_id(&job_id);
+                        // Make sure we're working on the correct job
+                        if state.job_id.as_ref() != Some(&job_id) {
+                            info!("Received benchmark for new job {}", job_id);
+                            state.reset_job_state();
+                            state.set_job_id(&job_id);
+                        }
 
                         // Store metadata for binary chunks
                         chunk_state.current_job_id = Some(job_id.clone());
@@ -179,7 +190,18 @@ async fn handle_connection(
                         params,
                         job_id,
                     } => {
-                        state.set_job_id(&job_id); // Update job ID
+                        // Verify we're processing the correct job
+                        if state.job_id.as_ref() != Some(&job_id) {
+                            warn!("Received segment for different job: {}", job_id);
+                            state.reset_job_state();
+                            state.set_job_id(&job_id);
+                        }
+
+                        // Only process if we've completed benchmark
+                        if !state.benchmark_completed {
+                            warn!("Received segment before benchmark completion");
+                            return Ok(());
+                        }
 
                         if let Some(proc) = &mut state.processor {
                             match proc
@@ -187,9 +209,13 @@ async fn handle_connection(
                                 .await
                             {
                                 Ok((processed_data, fps)) => {
-                                    info!("Segment processing complete: {} FPS", fps);
+                                    info!(
+                                        "Segment {} processing complete: {} FPS",
+                                        segment_id, fps
+                                    );
+                                    state.current_segment = Some(segment_id.clone());
                                     let response = ClientMessage::SegmentComplete {
-                                        segment_id: segment_id.clone(),
+                                        segment_id,
                                         fps,
                                         data: processed_data,
                                         format: format.clone(),
@@ -210,9 +236,19 @@ async fn handle_connection(
                     }
                     ServerMessage::Error { code, message } => {
                         error!("Server error: {} - {}", code, message);
+                        // Reset state on error
+                        state.reset_job_state();
+                        state.benchmark_completed = false;
+                        state.current_segment = None;
                     }
                     ServerMessage::JobComplete { job_id } => {
                         info!("Job {} completed", job_id);
+                        // Only reset if this completion is for our current job
+                        if state.job_id.as_ref() == Some(&job_id) {
+                            state.reset_job_state();
+                            state.benchmark_completed = false;
+                            state.current_segment = None;
+                        }
                     }
                 }
             }

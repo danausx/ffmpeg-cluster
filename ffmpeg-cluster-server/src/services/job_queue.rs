@@ -81,20 +81,16 @@ impl JobQueue {
             job_id,
             self.queue.len()
         );
+
         job_id
     }
 
-    pub fn get_next_job(&mut self) -> Option<&mut Job> {
-        if self.active_job.is_none() {
-            if let Some(job_id) = self.queue.first() {
-                let job_id = job_id.clone();
-                self.active_job = Some(job_id.clone());
-                info!("Getting next job: {}", job_id);
-                self.jobs.get_mut(&job_id)
-            } else {
-                info!("No jobs in queue");
-                None
-            }
+    pub fn get_next_job(&mut self) -> Option<&Job> {
+        // Only return the next job if there's no active job
+        if self.active_job.is_none() && !self.queue.is_empty() {
+            let job_id = &self.queue[0];
+            self.active_job = Some(job_id.clone());
+            self.jobs.get(job_id)
         } else {
             None
         }
@@ -132,7 +128,7 @@ impl JobQueue {
             job.info.completed_at = Some(now);
             job.info.progress = 100.0;
 
-            // Remove from queue and clear active job
+            // Remove completed job from queue and clear active job
             if let Some(pos) = self.queue.iter().position(|x| x == job_id) {
                 self.queue.remove(pos);
             }
@@ -140,7 +136,11 @@ impl JobQueue {
                 self.active_job = None;
             }
 
-            info!("Job {} marked as completed", job_id);
+            info!(
+                "Job {} completed. Remaining jobs in queue: {}",
+                job_id,
+                self.queue.len()
+            );
         }
     }
 

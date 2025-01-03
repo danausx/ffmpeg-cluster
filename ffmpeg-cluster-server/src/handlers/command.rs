@@ -105,7 +105,7 @@ async fn handle_command_socket(
     Ok(())
 }
 
-async fn handle_process_local_file(
+pub async fn handle_process_local_file(
     file_path: String,
     config: Option<JobConfig>,
     state: &Arc<Mutex<AppState>>,
@@ -170,14 +170,10 @@ async fn handle_process_local_file(
         }
     };
 
-    info!(
-        "Attempting to detect format for file: {} (canonical path: {})",
-        file_path,
-        canonical_path.display()
-    );
-
-    let format =
-        match SegmentManager::detect_format(canonical_path.to_str().unwrap_or(&file_path)).await {
+    // First phase: Create job and gather data
+    let (job_id, job_config, file_path) = {
+        let mut state = state.lock().await;
+        let format = match state.segment_manager.set_input_format(&file_path).await {
             Ok(fmt) => fmt,
             Err(e) => {
                 return ServerResponse::Error {
@@ -191,8 +187,6 @@ async fn handle_process_local_file(
             }
         };
 
-    let job_id = {
-        let mut state = state.lock().await;
         let config = config.unwrap_or_else(|| JobConfig {
             ffmpeg_params: vec![
                 "-c:v".to_string(),
@@ -204,70 +198,58 @@ async fn handle_process_local_file(
             exactly: true,
         });
 
-        state.current_input = Some(file_path.clone());
-        let job_id = state.job_queue.add_job(path, config, format);
-        state.current_job = Some(job_id.clone());
-
-        // Update the segment manager with the new job ID
-        state.segment_manager.set_job_id(job_id.clone());
-        // Reinitialize the segment manager
-        if let Err(e) = state.segment_manager.init().await {
-            error!("Failed to initialize segment manager: {}", e);
-        }
-
-        job_id
+        // Add to queue without modifying current job
+        let job_id = state
+            .job_queue
+            .add_job(canonical_path.clone(), config.clone(), format);
+        (job_id, config, canonical_path.to_string_lossy().to_string())
     };
 
-    // First, send a new job notification to all connected clients
-    let state = state.lock().await;
-    if let Some(job) = state.job_queue.get_job(&job_id) {
-        let msg = ServerMessage::ClientId {
-            id: "broadcast".to_string(),
-            job_id: job_id.clone(),
-        };
+    // Second phase: Initialize job if needed
+    // In the second phase of handle_process_local_file, replace the initialization block with:
 
-        let msg_str = match serde_json::to_string(&msg) {
-            Ok(str) => str,
-            Err(e) => {
-                return ServerResponse::Error {
-                    code: "SERIALIZATION_ERROR".to_string(),
-                    message: format!("Failed to serialize job message: {}", e),
-                };
-            }
-        };
+    {
+        let mut state = state.lock().await;
+        // Only initialize first job if no job is currently being processed
+        if state.current_job.is_none() {
+            // Get state values first
+            let benchmark_seconds = state.config.benchmark_seconds;
+            let client_count = state.clients.len();
 
-        let broadcast_msg = crate::ServerMessage {
-            target: None,
-            content: msg_str,
-        };
+            // Now get and process the job
+            if let Some(job) = state.job_queue.get_next_job() {
+                let job_id = job.info.job_id.clone();
+                let job_file_path = job.file_path.to_string_lossy().to_string();
+                let job_ffmpeg_params = job.config.ffmpeg_params.clone();
+                let required_clients = job.config.required_clients;
 
-        if let Err(e) = state.broadcast_tx.send(broadcast_msg) {
-            error!("Failed to broadcast job assignment: {}", e);
-            return ServerResponse::Error {
-                code: "BROADCAST_ERROR".to_string(),
-                message: format!("Failed to broadcast job assignment: {}", e),
-            };
-        }
+                // Drop the job borrow
+                drop(job);
 
-        // If we have enough clients, start the benchmark phase immediately
-        if state.clients.len() >= job.config.required_clients {
-            // Create and send benchmark data
-            if let Some(input_file) = state.current_input.as_ref() {
-                match state
-                    .segment_manager
-                    .create_benchmark_sample(input_file, state.config.benchmark_seconds)
-                    .await
-                {
-                    Ok(sample) => {
+                state.current_job = Some(job_id.clone());
+                state.current_input = Some(job_file_path.clone());
+
+                // Set up segment manager for the first job
+                state.segment_manager.set_job_id(job_id.clone());
+                if let Err(e) = state.segment_manager.init().await {
+                    error!("Failed to initialize segment manager: {}", e);
+                    return ServerResponse::Error {
+                        code: "SEGMENT_MANAGER_ERROR".to_string(),
+                        message: format!("Failed to initialize segment manager: {}", e),
+                    };
+                }
+
+                // Start benchmark if enough clients
+                if client_count >= required_clients {
+                    if let Ok(sample) = state
+                        .segment_manager
+                        .create_benchmark_sample(&job_file_path, benchmark_seconds)
+                        .await
+                    {
                         let benchmark_msg = ServerMessage::BenchmarkRequest {
                             data: sample.data,
                             format: sample.format,
-                            params: state
-                                .config
-                                .ffmpeg_params
-                                .split_whitespace()
-                                .map(String::from)
-                                .collect(),
+                            params: job_ffmpeg_params,
                             job_id: job_id.clone(),
                         };
 
@@ -276,20 +258,17 @@ async fn handle_process_local_file(
                                 target: None,
                                 content: msg_str,
                             };
-
                             if let Err(e) = state.broadcast_tx.send(broadcast_msg) {
                                 error!("Failed to broadcast benchmark request: {}", e);
                             }
                         }
-                    }
-                    Err(e) => {
-                        error!("Failed to create benchmark sample: {}", e);
                     }
                 }
             }
         }
     }
 
+    // Return job created response
     ServerResponse::JobCreated { job_id }
 }
 
@@ -423,130 +402,11 @@ pub async fn handle_upload_and_process(
     config: Option<JobConfig>,
     state: &Arc<Mutex<AppState>>,
 ) -> ServerResponse {
-    info!(
-        "Received file upload request: {} ({} bytes)",
-        file_name,
-        data.len()
-    );
-
-    // Create upload directory if it doesn't exist
-    let temp_dir = PathBuf::from("work").join("server").join("uploads");
-    if !temp_dir.exists() {
-        if let Err(e) = tokio::fs::create_dir_all(&temp_dir).await {
-            error!("Failed to create upload directory: {}", e);
-            return ServerResponse::Error {
-                code: "DIRECTORY_CREATE_FAILED".to_string(),
-                message: format!("Failed to create upload directory: {}", e),
-            };
-        }
-    }
-
-    // Generate UUID for the file
-    let file_uuid = Uuid::new_v4();
-    let file_ext = std::path::Path::new(&file_name)
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .unwrap_or("mp4");
-
-    // Create filename with UUID
-    let unique_filename = format!("{}_{}.{}", file_uuid, file_name, file_ext);
-    let file_path = temp_dir.join(&unique_filename);
-    info!("Saving uploaded file to: {}", file_path.display());
-
-    // Ensure file is properly written and synced
-    let mut file = match File::create(&file_path).await {
-        Ok(file) => file,
-        Err(e) => {
-            error!("Failed to create file: {}", e);
-            return ServerResponse::Error {
-                code: "FILE_CREATE_FAILED".to_string(),
-                message: format!("Failed to create file: {}", e),
-            };
-        }
-    };
-
-    if let Err(e) = file.write_all(&data).await {
-        error!("Failed to write file: {}", e);
-        return ServerResponse::Error {
-            code: "FILE_WRITE_FAILED".to_string(),
-            message: format!("Failed to write file: {}", e),
-        };
-    }
-
-    if let Err(e) = file.sync_all().await {
-        error!("Failed to sync file: {}", e);
-        return ServerResponse::Error {
-            code: "FILE_SYNC_FAILED".to_string(),
-            message: format!("Failed to sync file: {}", e),
-        };
-    }
-
-    // Add a small delay to ensure filesystem sync
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
-    // Verify file exists and is readable
-    if !file_path.exists() {
-        return ServerResponse::Error {
-            code: "FILE_VERIFY_FAILED".to_string(),
-            message: "File was not properly saved".to_string(),
-        };
-    }
-
-    // Verify file size
-    match tokio::fs::metadata(&file_path).await {
-        Ok(metadata) => {
-            if metadata.len() != data.len() as u64 {
-                error!(
-                    "File size mismatch: expected {}, got {}",
-                    data.len(),
-                    metadata.len()
-                );
-                return ServerResponse::Error {
-                    code: "FILE_SIZE_MISMATCH".to_string(),
-                    message: "File size mismatch after write".to_string(),
-                };
-            }
-        }
-        Err(e) => {
-            error!("Failed to verify file: {}", e);
-            return ServerResponse::Error {
-                code: "FILE_VERIFY_FAILED".to_string(),
-                message: format!("Failed to verify file: {}", e),
-            };
-        }
-    }
-
-    // Store the absolute path in the state for future reference
-    let canonical_path = match file_path.canonicalize() {
-        Ok(p) => p,
-        Err(e) => {
-            return ServerResponse::Error {
-                code: "PATH_RESOLUTION_ERROR".to_string(),
-                message: format!("Failed to resolve path {}: {}", file_path.display(), e),
-            };
-        }
-    };
-
-    info!("Canonical path resolved: {}", canonical_path.display());
-    let format =
-        match SegmentManager::detect_format(canonical_path.to_str().unwrap_or(&unique_filename))
-            .await
-        {
-            Ok(fmt) => {
-                info!("Successfully detected format: {}", fmt);
-                fmt
-            }
-            Err(e) => {
-                error!("Format detection failed: {}", e);
-                return ServerResponse::Error {
-                    code: "FORMAT_DETECTION_FAILED".to_string(),
-                    message: format!("Failed to detect format: {}", e),
-                };
-            }
-        };
-
-    let job_id = {
+    // First phase: Setup and file operations
+    let (job_id, job_config) = {
         let mut state = state.lock().await;
+
+        // Set default config if none provided
         let config = config.unwrap_or_else(|| JobConfig {
             ffmpeg_params: vec![
                 "-c:v".to_string(),
@@ -558,81 +418,89 @@ pub async fn handle_upload_and_process(
             exactly: true,
         });
 
-        // Store both the filename and the full path
-        state.current_input = Some(
-            canonical_path
-                .to_str()
-                .unwrap_or(&unique_filename)
-                .to_string(),
-        );
-        let job_id = state.job_queue.add_job(canonical_path, config, format);
-        state.current_job = Some(job_id.clone());
-
-        state.segment_manager.set_job_id(job_id.clone());
-        if let Err(e) = state.segment_manager.init().await {
-            error!("Failed to initialize segment manager: {}", e);
-        }
-
-        job_id
-    };
-
-    // Handle client notifications and benchmark phase
-    let state = state.lock().await;
-    if let Some(job) = state.job_queue.get_job(&job_id) {
-        let msg = ServerMessage::ClientId {
-            id: "broadcast".to_string(),
-            job_id: job_id.clone(),
-        };
-
-        if let Ok(msg_str) = serde_json::to_string(&msg) {
-            let broadcast_msg = crate::ServerMessage {
-                target: None,
-                content: msg_str,
-            };
-
-            if let Err(e) = state.broadcast_tx.send(broadcast_msg) {
-                error!("Failed to broadcast job assignment: {}", e);
+        // Create work directory for uploads if it doesn't exist
+        let upload_dir = PathBuf::from("work").join("server").join("uploads");
+        if !upload_dir.exists() {
+            if let Err(e) = tokio::fs::create_dir_all(&upload_dir).await {
                 return ServerResponse::Error {
-                    code: "BROADCAST_ERROR".to_string(),
-                    message: format!("Failed to broadcast job assignment: {}", e),
+                    code: "UPLOAD_ERROR".to_string(),
+                    message: format!("Failed to create upload directory: {}", e),
                 };
             }
         }
 
-        // Start benchmark phase if enough clients
-        if state.clients.len() >= job.config.required_clients {
+        // Save uploaded file
+        let file_path = upload_dir.join(&file_name);
+        if let Err(e) = tokio::fs::write(&file_path, &data).await {
+            return ServerResponse::Error {
+                code: "UPLOAD_ERROR".to_string(),
+                message: format!("Failed to save uploaded file: {}", e),
+            };
+        }
+
+        // Detect format
+        let format = match state.segment_manager.set_input_format(&file_name).await {
+            Ok(fmt) => fmt,
+            Err(e) => {
+                return ServerResponse::Error {
+                    code: "FORMAT_DETECTION_FAILED".to_string(),
+                    message: e.to_string(),
+                }
+            }
+        };
+
+        // Add job to queue and get its ID
+        let job_id = state.job_queue.add_job(file_path, config.clone(), format);
+
+        (job_id, config)
+    };
+
+    // Second phase: Job initialization if no current job
+    let should_start_processing = {
+        let mut state = state.lock().await;
+        if state.current_job.is_none() {
+            if let Some(next_job) = state.job_queue.get_next_job() {
+                let next_job_id = next_job.info.job_id.clone();
+                let file_path = next_job.file_path.to_string_lossy().to_string();
+                state.current_job = Some(next_job_id);
+                state.current_input = Some(file_path);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    };
+
+    // Third phase: Start processing if needed
+    if should_start_processing {
+        let mut state = state.lock().await;
+        let client_count = state.clients.len();
+
+        if client_count >= job_config.required_clients {
             if let Some(input_file) = state.current_input.as_ref() {
-                match state
+                if let Ok(sample) = state
                     .segment_manager
                     .create_benchmark_sample(input_file, state.config.benchmark_seconds)
                     .await
                 {
-                    Ok(sample) => {
-                        let benchmark_msg = ServerMessage::BenchmarkRequest {
-                            data: sample.data,
-                            format: sample.format,
-                            params: state
-                                .config
-                                .ffmpeg_params
-                                .split_whitespace()
-                                .map(String::from)
-                                .collect(),
-                            job_id: job_id.clone(),
+                    let benchmark_msg = ServerMessage::BenchmarkRequest {
+                        data: sample.data,
+                        format: sample.format,
+                        params: job_config.ffmpeg_params,
+                        job_id: job_id.clone(),
+                    };
+
+                    if let Ok(msg_str) = serde_json::to_string(&benchmark_msg) {
+                        let broadcast_msg = crate::ServerMessage {
+                            target: None,
+                            content: msg_str,
                         };
 
-                        if let Ok(msg_str) = serde_json::to_string(&benchmark_msg) {
-                            let broadcast_msg = crate::ServerMessage {
-                                target: None,
-                                content: msg_str,
-                            };
-
-                            if let Err(e) = state.broadcast_tx.send(broadcast_msg) {
-                                error!("Failed to broadcast benchmark request: {}", e);
-                            }
+                        if let Err(e) = state.broadcast_tx.send(broadcast_msg) {
+                            error!("Failed to broadcast benchmark request: {}", e);
                         }
-                    }
-                    Err(e) => {
-                        error!("Failed to create benchmark sample: {}", e);
                     }
                 }
             }
