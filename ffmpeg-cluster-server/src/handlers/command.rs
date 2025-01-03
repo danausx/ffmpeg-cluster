@@ -13,6 +13,7 @@ use ffmpeg_cluster_common::models::messages::{
 use futures::{SinkExt, StreamExt};
 use std::{path::PathBuf, sync::Arc};
 use tokio::sync::Mutex;
+use tokio::{fs::File, io::AsyncWriteExt};
 use tracing::{error, info};
 
 pub async fn command_ws_handler(
@@ -443,12 +444,56 @@ pub async fn handle_upload_and_process(
     let file_path = temp_dir.join(&file_name);
     info!("Saving uploaded file to: {}", file_path.display());
 
-    if let Err(e) = tokio::fs::write(&file_path, &data).await {
-        error!("Failed to write uploaded file: {}", e);
+    // Ensure file is properly written and synced
+    let mut file = match File::create(&file_path).await {
+        Ok(file) => file,
+        Err(e) => {
+            error!("Failed to create file: {}", e);
+            return ServerResponse::Error {
+                code: "FILE_CREATE_FAILED".to_string(),
+                message: format!("Failed to create file: {}", e),
+            };
+        }
+    };
+
+    if let Err(e) = file.write_all(&data).await {
+        error!("Failed to write file: {}", e);
         return ServerResponse::Error {
             code: "FILE_WRITE_FAILED".to_string(),
-            message: format!("Failed to write uploaded file: {}", e),
+            message: format!("Failed to write file: {}", e),
         };
+    }
+
+    if let Err(e) = file.sync_all().await {
+        error!("Failed to sync file: {}", e);
+        return ServerResponse::Error {
+            code: "FILE_SYNC_FAILED".to_string(),
+            message: format!("Failed to sync file: {}", e),
+        };
+    }
+
+    // Verify file size
+    match tokio::fs::metadata(&file_path).await {
+        Ok(metadata) => {
+            if metadata.len() != data.len() as u64 {
+                error!(
+                    "File size mismatch: expected {}, got {}",
+                    data.len(),
+                    metadata.len()
+                );
+                return ServerResponse::Error {
+                    code: "FILE_SIZE_MISMATCH".to_string(),
+                    message: "File size mismatch after write".to_string(),
+                };
+            }
+        }
+        Err(e) => {
+            error!("Failed to verify file: {}", e);
+            return ServerResponse::Error {
+                code: "FILE_VERIFY_FAILED".to_string(),
+                message: format!("Failed to verify file: {}", e),
+            };
+        }
     }
 
     // Get canonical path
