@@ -3,6 +3,7 @@ use ffmpeg_cluster_common::models::messages::{ClientMessage, ServerMessage};
 use futures_util::{stream::SplitSink, SinkExt, StreamExt};
 use std::time::Duration;
 use tokio::net::TcpStream;
+use tokio_tungstenite::tungstenite::protocol::Role;
 use tokio_tungstenite::{
     connect_async_with_config,
     tungstenite::protocol::{Message, WebSocketConfig},
@@ -33,6 +34,9 @@ struct Args {
 
     #[arg(long)]
     upload_file: Option<String>,
+
+    #[arg(long, default_value = "false")]
+    participate: bool,
 }
 
 struct ClientState {
@@ -277,41 +281,57 @@ async fn process_benchmark_data(
 
 async fn upload_file(
     file_path: &str,
-    ws_stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    participate: bool,
+    mut ws_stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (mut write, mut read) = StreamExt::split(ws_stream);
-
     // Read the file
-    let data = tokio::fs::read(file_path).await?;
+    let data = match tokio::fs::read(file_path).await {
+        Ok(data) => data,
+        Err(e) => {
+            error!("Failed to read file {}: {}", file_path, e);
+            return Err(Box::new(e));
+        }
+    };
+
     let file_name = std::path::Path::new(file_path)
         .file_name()
         .unwrap_or_default()
         .to_string_lossy()
         .to_string();
 
+    info!("Uploading file {} ({} bytes)", file_name, data.len());
+
     // Create upload message
     let message = ClientMessage::UploadAndProcessFile {
         file_name,
         data,
         config: None,
+        participate,
     };
 
     // Send the message
-    write
+    ws_stream
         .send(Message::Text(serde_json::to_string(&message)?.into()))
         .await?;
 
-    // Wait for response
-    while let Some(msg) = read.next().await {
-        match msg? {
-            Message::Text(text) => {
-                println!("Server response: {}", text);
-                break;
+    // If not participating, wait for upload confirmation and return
+    if !participate {
+        while let Some(msg) = ws_stream.next().await {
+            match msg? {
+                Message::Text(text) => {
+                    info!("Server response: {}", text);
+                    break;
+                }
+                Message::Close(_) => break,
+                _ => continue,
             }
-            Message::Close(_) => break,
-            _ => continue,
         }
+        return Ok(());
     }
+
+    // If participating, hand over to normal connection handler
+    let mut state = ClientState::new();
+    handle_connection(&mut state, ws_stream).await?;
 
     Ok(())
 }
@@ -336,45 +356,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
     let args = Args::parse();
-
-    info!("FFmpeg Cluster Client starting...");
-    info!("Connecting to {}:{}", args.server_ip, args.server_port);
-
     let mut state = ClientState::new();
 
     if let Some(file_path) = &args.upload_file {
         match connect_to_server(&args).await {
             Ok(ws_stream) => {
                 info!("Connected to server, uploading file...");
-                if let Err(e) = upload_file(file_path, ws_stream).await {
-                    error!("Failed to upload file: {}", e);
+                upload_file(file_path, args.participate, ws_stream).await?;
+                if !args.participate {
+                    return Ok(());
                 }
-                return Ok(());
             }
             Err(e) => {
                 error!("Failed to connect: {}", e);
                 return Err(e);
             }
         }
-    }
-
-    loop {
-        match connect_to_server(&args).await {
-            Ok(ws_stream) => {
-                info!("WebSocket connection established successfully");
-                match handle_connection(&mut state, ws_stream).await {
-                    Ok(()) => info!("Connection handled successfully"),
-                    Err(e) => error!("Connection handling error: {}", e),
+    } else {
+        // Normal client operation
+        loop {
+            match connect_to_server(&args).await {
+                Ok(ws_stream) => {
+                    info!("Connected to server");
+                    if let Err(e) = handle_connection(&mut state, ws_stream).await {
+                        error!("Connection error: {}", e);
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to connect: {}", e);
                 }
             }
-            Err(e) => error!("Failed to connect: {}", e),
-        }
 
-        if args.persistent {
-            info!("Reconnecting in {} seconds...", args.reconnect_delay);
+            if !args.persistent {
+                break;
+            }
+
             tokio::time::sleep(Duration::from_secs(args.reconnect_delay)).await;
-        } else {
-            break;
+            info!("Attempting to reconnect...");
         }
     }
 

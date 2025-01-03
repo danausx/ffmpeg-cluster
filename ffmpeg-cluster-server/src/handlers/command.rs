@@ -286,6 +286,7 @@ async fn handle_process_local_file(
 
     ServerResponse::JobCreated { job_id }
 }
+
 async fn handle_process_video_data(
     video_data: VideoData,
     config: Option<JobConfig>,
@@ -416,6 +417,7 @@ async fn handle_upload_and_process(
     config: Option<JobConfig>,
     state: &Arc<Mutex<AppState>>,
 ) -> ServerResponse {
+    // Create upload directory if it doesn't exist
     let temp_dir = PathBuf::from("work").join("server").join("uploads");
     if !temp_dir.exists() {
         if let Err(e) = tokio::fs::create_dir_all(&temp_dir).await {
@@ -426,6 +428,7 @@ async fn handle_upload_and_process(
         }
     }
 
+    // Save uploaded file
     let file_path = temp_dir.join(&file_name);
     if let Err(e) = tokio::fs::write(&file_path, &data).await {
         return ServerResponse::Error {
@@ -434,62 +437,11 @@ async fn handle_upload_and_process(
         };
     }
 
-    // Detect format
-    let format = match SegmentManager::detect_format(file_path.to_str().unwrap()).await {
-        Ok(fmt) => fmt,
-        Err(e) => {
-            return ServerResponse::Error {
-                code: "FORMAT_DETECTION_FAILED".to_string(),
-                message: format!("Failed to detect file format: {}", e),
-            }
-        }
-    };
-
-    let job_id = {
-        let mut state = state.lock().await;
-        let config = config.unwrap_or_else(|| JobConfig {
-            ffmpeg_params: vec![
-                "-c:v".to_string(),
-                "libx264".to_string(),
-                "-preset".to_string(),
-                "medium".to_string(),
-            ],
-            required_clients: state.config.required_clients,
-            exactly: true,
-        });
-
-        state.current_input = Some(file_path.to_str().unwrap().to_string());
-        let job_id = state.job_queue.add_job(file_path, config, format);
-        state.current_job = Some(job_id.clone());
-
-        // Update the segment manager
-        state.segment_manager.set_job_id(job_id.clone());
-        if let Err(e) = state.segment_manager.init().await {
-            error!("Failed to initialize segment manager: {}", e);
-        }
-
-        job_id
-    };
-
-    // Send job notification to clients
-    let state = state.lock().await;
-    if let Some(job) = state.job_queue.get_job(&job_id) {
-        let msg = ServerMessage::ClientId {
-            id: "broadcast".to_string(),
-            job_id: job_id.clone(),
-        };
-
-        if let Ok(msg_str) = serde_json::to_string(&msg) {
-            let broadcast_msg = crate::ServerMessage {
-                target: None,
-                content: msg_str,
-            };
-
-            if let Err(e) = state.broadcast_tx.send(broadcast_msg) {
-                error!("Failed to broadcast job assignment: {}", e);
-            }
-        }
-    }
-
-    ServerResponse::JobCreated { job_id }
+    // Delegate to existing process_local_file handler
+    handle_process_local_file(
+        file_path.to_str().unwrap_or_default().to_string(),
+        config,
+        state,
+    )
+    .await
 }

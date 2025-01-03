@@ -102,7 +102,7 @@ pub enum ClientStatus {
     Disconnected,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum ClientMessage {
     RequestId,
     BenchmarkResult {
@@ -117,13 +117,11 @@ pub enum ClientMessage {
     SegmentFailed {
         error: String,
     },
-    Finish {
-        fps: f64,
-    },
     UploadAndProcessFile {
         file_name: String,
         data: Vec<u8>,
         config: Option<JobConfig>,
+        participate: bool,
     },
 }
 
