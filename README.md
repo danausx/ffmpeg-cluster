@@ -4,6 +4,8 @@
 
 FFmpeg Cluster is a distributed video processing system built in Rust that leverages hardware-accelerated FFmpeg encoding across multiple machines. It uses WebSocket communication for real-time coordination and supports automatic hardware detection for optimal performance.
 
+<img src="assets/header.webp" alt="Wemos ESP32 Pinout" width="1000%" />
+
 ## Key Features
 
 - **Hardware-Accelerated Processing**: Supports multiple encoders:
