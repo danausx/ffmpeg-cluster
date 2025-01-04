@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use directories::ProjectDirs;
 use sqlx::sqlite::SqlitePoolOptions;
+use std::path::PathBuf;
 use tracing::info;
 
 pub struct StorageManager {
@@ -22,11 +23,18 @@ impl StorageManager {
 
         // Create the database file path
         let db_path = data_dir.join("client.db");
-
         info!("Database path: {}", db_path.display());
 
-        // Create database connection
-        let database_url = format!("sqlite:{}", db_path.display());
+        // Create database connection with proper mode
+        let database_url = format!("sqlite://{}?mode=rwc", db_path.display());
+
+        // Ensure the directory exists
+        if let Some(parent) = db_path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .context("Failed to create database directory")?;
+        }
+
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect(&database_url)
