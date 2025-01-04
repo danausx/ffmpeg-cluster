@@ -4,7 +4,7 @@ use tokio::process::Command;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-#[derive(Debug, Clone, clap::ValueEnum)]
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
 pub enum HwAccel {
     Auto,
     None,

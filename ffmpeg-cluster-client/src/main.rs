@@ -37,6 +37,9 @@ struct Args {
 
     #[arg(long, default_value_t = false)]
     participate: bool,
+
+    #[arg(long, default_value = "auto")]
+    hw_accel: HwAccel,
 }
 
 struct ClientState {
@@ -105,6 +108,7 @@ async fn handle_connection(
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >,
     storage: &StorageManager,
+    args: &Args,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (mut write, mut read) = StreamExt::split(ws_stream);
     let mut chunk_state = ChunkState::default();
@@ -132,7 +136,7 @@ async fn handle_connection(
                             state.client_id = Some(id.clone());
 
                             if state.processor.is_none() {
-                                let proc = FfmpegProcessor::new(&id, HwAccel::Auto).await;
+                                let proc = FfmpegProcessor::new(&id, args.hw_accel).await;
                                 state.processor = Some(proc);
                             }
                         }
@@ -148,7 +152,7 @@ async fn handle_connection(
                         if state.client_id.is_none() {
                             state.client_id = Some(id.clone());
                             if state.processor.is_none() {
-                                let proc = FfmpegProcessor::new(&id, HwAccel::Auto).await;
+                                let proc = FfmpegProcessor::new(&id, args.hw_accel).await;
                                 state.processor = Some(proc);
                             }
                         }
@@ -332,6 +336,7 @@ async fn upload_file(
     participate: bool,
     mut ws_stream: WebSocketStream<MaybeTlsStream<TcpStream>>,
     storage: &StorageManager,
+    args: &Args,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Read the file
     let data = tokio::fs::read(file_path).await?;
@@ -383,9 +388,8 @@ async fn upload_file(
     }
 
     if participate {
-        // If participating, hand over to normal connection handler
         let mut state = ClientState::new();
-        if let Err(e) = handle_connection(&mut state, ws_stream, &storage).await {
+        if let Err(e) = handle_connection(&mut state, ws_stream, &storage, args).await {
             error!("Connection error: {}", e);
         }
     }
@@ -434,7 +438,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match connect_to_server(&args).await {
             Ok(ws_stream) => {
                 info!("Connected to server, uploading file...");
-                upload_file(file_path, args.participate, ws_stream, &storage).await?;
+                upload_file(file_path, args.participate, ws_stream, &storage, &args).await?;
                 if !args.participate {
                     return Ok(());
                 }
@@ -450,7 +454,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             match connect_to_server(&args).await {
                 Ok(ws_stream) => {
                     info!("Connected to server");
-                    if let Err(e) = handle_connection(&mut state, ws_stream, &storage).await {
+                    if let Err(e) = handle_connection(&mut state, ws_stream, &storage, &args).await
+                    {
                         error!("Connection error: {}", e);
                     }
                 }
