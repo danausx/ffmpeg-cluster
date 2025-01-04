@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use super::EncoderCapabilities;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobConfig {
     pub ffmpeg_params: Vec<String>,
@@ -105,6 +107,9 @@ pub enum ClientStatus {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum ClientMessage {
     RequestId,
+    Capabilities {
+        encoders: EncoderCapabilities,
+    },
     BenchmarkResult {
         fps: f64,
     },

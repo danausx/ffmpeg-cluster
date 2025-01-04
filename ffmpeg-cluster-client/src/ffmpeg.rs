@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use ffmpeg_cluster_common::models::{EncoderCapabilities, HwEncoder};
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
 use tracing::{error, info, warn};
@@ -13,16 +14,6 @@ pub enum HwAccel {
     Vaapi,
     Videotoolbox,
     Amf,
-}
-
-#[derive(Debug, Clone)]
-pub enum HwEncoder {
-    Videotoolbox, // macOS
-    Nvenc,        // NVIDIA
-    Vaapi,        // Intel/AMD on Linux
-    QuickSync,    // Intel
-    Amf,          // AMD
-    None,         // Fallback to software
 }
 
 pub struct FfmpegProcessor {
@@ -86,7 +77,7 @@ impl FfmpegProcessor {
     }
 
     pub async fn new(client_id: &str, preferred_hw: HwAccel) -> Self {
-        let hw_encoder = Self::detect_hw_encoder(preferred_hw).await;
+        let (hw_encoder, capabilities) = Self::detect_hw_encoder(preferred_hw).await;
         let work_dir = PathBuf::from("work").join("client").join(client_id);
 
         if !work_dir.exists() {
@@ -104,11 +95,21 @@ impl FfmpegProcessor {
         }
     }
 
-    async fn detect_hw_encoder(preferred_hw: HwAccel) -> HwEncoder {
+    async fn detect_hw_encoder(preferred_hw: HwAccel) -> (HwEncoder, EncoderCapabilities) {
         // If user explicitly chose "none", return immediately
         if matches!(preferred_hw, HwAccel::None) {
             info!("Software encoding selected explicitly");
-            return HwEncoder::None;
+            return (
+                HwEncoder::None,
+                EncoderCapabilities {
+                    has_nvenc: false,
+                    has_qsv: false,
+                    has_vaapi: false,
+                    has_videotoolbox: false,
+                    has_amf: false,
+                    selected_encoder: HwEncoder::None,
+                },
+            );
         }
 
         let output = match Command::new(Self::get_ffmpeg_path())
@@ -119,42 +120,35 @@ impl FfmpegProcessor {
             Ok(output) => String::from_utf8_lossy(&output.stdout).to_string(),
             Err(e) => {
                 error!("Failed to run ffmpeg: {}", e);
-                return HwEncoder::None;
+                return (HwEncoder::None, EncoderCapabilities::default());
             }
         };
 
-        // Function to check encoder availability and log result
-        let check_encoder = |name: &str, desc: &str| {
-            let available = output.contains(name);
-            if available {
-                info!("Found {} encoder ({})", desc, name);
-            } else {
-                info!("{} encoder not available ({})", desc, name);
-            }
-            available
-        };
+        let has_nvenc = output.contains("h264_nvenc");
+        let has_qsv = output.contains("h264_qsv");
+        let has_vaapi = output.contains("h264_vaapi") && cfg!(target_os = "linux");
+        let has_videotoolbox = cfg!(target_os = "macos") && output.contains("h264_videotoolbox");
+        let has_amf = output.contains("h264_amf");
 
-        // Match based on preferred hardware
         let encoder = match preferred_hw {
             HwAccel::Auto => {
                 info!("Auto-detecting hardware encoder...");
-                if cfg!(target_os = "macos") && check_encoder("h264_videotoolbox", "VideoToolbox") {
+                if has_videotoolbox {
                     HwEncoder::Videotoolbox
-                } else if check_encoder("h264_nvenc", "NVIDIA NVENC") {
+                } else if has_nvenc {
                     HwEncoder::Nvenc
-                } else if check_encoder("h264_vaapi", "VAAPI") && cfg!(target_os = "linux") {
+                } else if has_vaapi {
                     HwEncoder::Vaapi
-                } else if check_encoder("h264_qsv", "Intel QuickSync") {
+                } else if has_qsv {
                     HwEncoder::QuickSync
-                } else if check_encoder("h264_amf", "AMD AMF") {
+                } else if has_amf {
                     HwEncoder::Amf
                 } else {
-                    info!("No hardware encoder found, falling back to software encoding");
                     HwEncoder::None
                 }
             }
             HwAccel::Nvenc => {
-                if check_encoder("h264_nvenc", "NVIDIA NVENC") {
+                if has_nvenc {
                     HwEncoder::Nvenc
                 } else {
                     warn!("NVENC not available, falling back to software encoding");
@@ -162,7 +156,7 @@ impl FfmpegProcessor {
                 }
             }
             HwAccel::Qsv => {
-                if check_encoder("h264_qsv", "Intel QuickSync") {
+                if has_qsv {
                     HwEncoder::QuickSync
                 } else {
                     warn!("QuickSync not available, falling back to software encoding");
@@ -170,7 +164,7 @@ impl FfmpegProcessor {
                 }
             }
             HwAccel::Vaapi => {
-                if check_encoder("h264_vaapi", "VAAPI") && cfg!(target_os = "linux") {
+                if has_vaapi {
                     HwEncoder::Vaapi
                 } else {
                     warn!("VAAPI not available, falling back to software encoding");
@@ -178,7 +172,7 @@ impl FfmpegProcessor {
                 }
             }
             HwAccel::Videotoolbox => {
-                if cfg!(target_os = "macos") && check_encoder("h264_videotoolbox", "VideoToolbox") {
+                if has_videotoolbox {
                     HwEncoder::Videotoolbox
                 } else {
                     warn!("VideoToolbox not available, falling back to software encoding");
@@ -186,7 +180,7 @@ impl FfmpegProcessor {
                 }
             }
             HwAccel::Amf => {
-                if check_encoder("h264_amf", "AMD AMF") {
+                if has_amf {
                     HwEncoder::Amf
                 } else {
                     warn!("AMD AMF not available, falling back to software encoding");
@@ -196,8 +190,16 @@ impl FfmpegProcessor {
             HwAccel::None => HwEncoder::None,
         };
 
-        info!("Selected encoder: {:?}", encoder);
-        encoder
+        let capabilities = EncoderCapabilities {
+            has_nvenc,
+            has_qsv,
+            has_vaapi,
+            has_videotoolbox,
+            has_amf,
+            selected_encoder: encoder.clone(),
+        };
+
+        (encoder, capabilities)
     }
 
     fn get_hw_encoding_params(&self) -> Vec<String> {
@@ -280,35 +282,31 @@ impl FfmpegProcessor {
 
         tokio::fs::write(&input_path, data).await?;
 
-        let mut args = vec![
-            "-y".to_string(),
-            "-i".to_string(),
-            input_path.to_str().unwrap().to_string(),
-        ];
+        // Convert all arguments to strings first
+        let mut ffmpeg_args: Vec<String> = vec!["-y".to_string()];
+        ffmpeg_args.extend(self.get_hw_encoding_params());
+        ffmpeg_args.push("-i".to_string());
+        ffmpeg_args.push(input_path.to_str().unwrap().to_string());
+        ffmpeg_args.extend(params.iter().cloned());
+        ffmpeg_args.push(output_path.to_str().unwrap().to_string());
 
-        // Add hardware acceleration parameters first
-        args.extend(self.get_hw_encoding_params());
+        // Convert to string slices for the Command
+        let ffmpeg_args_ref: Vec<&str> = ffmpeg_args.iter().map(|s| s.as_str()).collect();
 
-        // Add default encoding parameters
-        args.extend(self.get_default_encoding_params());
-
-        // Add any additional user parameters that might override defaults
-        args.extend(params.iter().cloned());
-        args.push(output_path.to_str().unwrap().to_string());
-
-        info!("Running FFmpeg benchmark with args: {:?}", args);
+        info!("Running FFmpeg benchmark command: {:?}", ffmpeg_args_ref);
 
         let output = Command::new(Self::get_ffmpeg_path())
-            .args(&args)
+            .args(&ffmpeg_args_ref)
             .output()
             .await
             .context("Failed to execute FFmpeg command")?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            error!("FFmpeg benchmark failed: {}", stderr);
-            let _ = tokio::fs::remove_dir_all(&temp_dir).await;
-            anyhow::bail!("FFmpeg benchmark failed: {}", stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            error!("FFmpeg stderr: {}", stderr);
+            error!("FFmpeg stdout: {}", stdout);
+            anyhow::bail!("FFmpeg benchmark failed with status: {}", output.status);
         }
 
         let elapsed = start_time.elapsed().as_secs_f64();
@@ -538,5 +536,10 @@ impl FfmpegProcessor {
         let frame_count = String::from_utf8(output.stdout)?.trim().parse::<u64>()?;
 
         Ok(frame_count)
+    }
+
+    pub async fn get_capabilities(&self) -> EncoderCapabilities {
+        let (_, capabilities) = Self::detect_hw_encoder(HwAccel::Auto).await;
+        capabilities
     }
 }

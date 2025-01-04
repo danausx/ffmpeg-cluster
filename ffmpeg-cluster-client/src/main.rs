@@ -115,8 +115,18 @@ async fn handle_connection(
     let mut last_update = std::time::Instant::now();
 
     if state.client_id.is_none() {
+        // First request ID
         let msg = serde_json::to_string(&ClientMessage::RequestId)?;
         write.send(Message::Text(msg.into())).await?;
+
+        // Then send capabilities
+        if let Some(proc) = &state.processor {
+            let capabilities = proc.get_capabilities().await;
+            let msg = serde_json::to_string(&ClientMessage::Capabilities {
+                encoders: capabilities,
+            })?;
+            write.send(Message::Text(msg.into())).await?;
+        }
     }
 
     while let Some(msg) = read.next().await {
