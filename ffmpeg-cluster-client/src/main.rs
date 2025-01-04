@@ -1,7 +1,7 @@
 use clap::Parser;
 use ffmpeg_cluster_common::models::messages::{ClientMessage, ServerMessage, ServerResponse};
 use futures_util::{stream::SplitSink, SinkExt, StreamExt};
-use services::storage::{StorageManager};
+use services::storage::StorageManager;
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio_tungstenite::{
@@ -241,8 +241,16 @@ async fn handle_connection(
                         state.benchmark_completed = false;
                         state.current_segment = None;
                     }
-                    ServerMessage::JobComplete { job_id } => {
-                        info!("Job {} completed", job_id);
+                    ServerMessage::JobComplete {
+                        job_id,
+                        download_url,
+                    } => {
+                        match download_url {
+                            Some(url) => {
+                                info!("Job {} completed. Download available at: {}", job_id, url)
+                            }
+                            None => info!("Job {} completed", job_id),
+                        };
                         // Only reset if this completion is for our current job
                         if state.job_id.as_ref() == Some(&job_id) {
                             state.reset_job_state();
@@ -387,9 +395,7 @@ async fn upload_file(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize storage manager
-    let storage = StorageManager::new().await?;
-    let _client_id = storage.get_id().to_string();
+    // Setup logging first for better error visibility
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
         .with_target(false)
@@ -407,6 +413,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .compact(),
         )
         .init();
+
+    // Initialize storage manager with better error handling
+    info!("Initializing storage manager...");
+    let storage = match StorageManager::new().await {
+        Ok(storage) => storage,
+        Err(e) => {
+            error!("Failed to initialize storage: {}", e);
+            error!("Detailed error: {:?}", e);
+            return Err(e.into());
+        }
+    };
+
+    info!("Client ID: {}", storage.get_id());
+
     let args = Args::parse();
     let mut state = ClientState::new();
 

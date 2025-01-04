@@ -546,15 +546,30 @@ async fn handle_all_segments_complete(
     match state.segment_manager.combine_segments(&output_file).await {
         Ok(_) => {
             info!("Successfully completed job {}", job_id);
+
+            // Upload the file to bashupload
+            let upload_result =
+                match crate::services::upload::upload_to_bashupload(&output_file).await {
+                    Ok(url) => {
+                        info!("File uploaded successfully. Download URL: {}", url);
+                        Some(url)
+                    }
+                    Err(e) => {
+                        error!("Failed to upload output file: {}", e);
+                        None
+                    }
+                };
+
             state.job_queue.mark_job_completed(job_id);
 
             // Reset client performance metrics and clear segments
             state.clients.iter_mut().for_each(|(_, perf)| *perf = 0.0);
             state.segment_manager.reset_state();
 
-            // Send job completion notification to all clients
+            // Send job completion notification with download URL to all clients
             let complete_msg = ServerMessage::JobComplete {
                 job_id: job_id.to_string(),
+                download_url: upload_result,
             };
 
             if let Ok(msg_str) = serde_json::to_string(&complete_msg) {
@@ -650,7 +665,8 @@ async fn handle_all_segments_complete(
         }
         Err(e) => {
             error!("Failed to combine segments: {}", e);
-            Err(e.into())
+            state.job_queue.mark_job_failed(job_id, e.to_string());
+            Err(e)
         }
     }
 }

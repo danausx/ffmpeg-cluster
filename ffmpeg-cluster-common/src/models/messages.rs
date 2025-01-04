@@ -153,5 +153,6 @@ pub enum ServerMessage {
     },
     JobComplete {
         job_id: String,
+        download_url: Option<String>,
     },
 }
