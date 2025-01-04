@@ -203,75 +203,66 @@ impl FfmpegProcessor {
     fn get_hw_encoding_params(&self) -> Vec<String> {
         match self.hw_encoder {
             HwEncoder::Videotoolbox => vec![
-                "-c:v",
-                "h264_videotoolbox",
-                "-b:v",
-                "2M",
-                "-tag:v",
-                "avc1",
-                "-profile:v",
-                "high",
+                "-init_hw_device",
+                "videotoolbox=vt",
+                "-filter_hw_device",
+                "vt",
             ],
-            HwEncoder::Nvenc => vec![
-                "-c:v",
-                "h264_nvenc",
-                "-preset",
-                "p4",
-                "-b:v",
-                "2M",
-                "-profile:v",
-                "high",
-            ],
+            HwEncoder::Nvenc => vec![], // NVENC doesn't need special hwaccel params
             HwEncoder::Vaapi => vec![
                 "-vaapi_device",
                 "/dev/dri/renderD128",
                 "-vf",
                 "format=nv12,hwupload",
-                "-c:v",
-                "h264_vaapi",
-                "-profile:v",
-                "high",
-                "-b:v",
-                "2M",
             ],
-            HwEncoder::QuickSync => vec![
-                "-init_hw_device",
-                "qsv=hw",
-                "-filter_hw_device",
-                "hw",
-                "-c:v",
-                "h264_qsv",
-                "-preset",
-                "faster",
-                "-b:v",
-                "2M",
-                "-profile:v",
-                "high",
-            ],
-            HwEncoder::Amf => vec![
-                "-c:v",
-                "h264_amf",
-                "-quality",
-                "speed",
-                "-profile:v",
-                "high",
-                "-b:v",
-                "2M",
-            ],
-            HwEncoder::None => vec![
-                "-c:v",
-                "libx264",
-                "-preset",
-                "fast",
-                "-profile:v",
-                "high",
-                "-crf",
-                "23",
-            ],
+            HwEncoder::QuickSync => vec!["-init_hw_device", "qsv=hw", "-filter_hw_device", "hw"],
+            HwEncoder::Amf => vec![], // AMF also doesn't need special hwaccel params
+            HwEncoder::None => vec![], // No hardware acceleration parameters
         }
         .iter()
         .map(|&s| s.to_string())
         .collect()
+    }
+
+    // Add a new method for default encoding parameters
+    fn get_default_encoding_params(&self) -> Vec<String> {
+        let mut params = vec![
+            "-c:v".to_string(),
+            match self.hw_encoder {
+                HwEncoder::Videotoolbox => "h264_videotoolbox",
+                HwEncoder::Nvenc => "h264_nvenc",
+                HwEncoder::Vaapi => "h264_vaapi",
+                HwEncoder::QuickSync => "h264_qsv",
+                HwEncoder::Amf => "h264_amf",
+                HwEncoder::None => "libx264",
+            }
+            .to_string(),
+            "-profile:v".to_string(),
+            "high".to_string(),
+            "-b:v".to_string(),
+            "2M".to_string(),
+        ];
+
+        // Add encoder-specific quality presets
+        match self.hw_encoder {
+            HwEncoder::Nvenc => {
+                params.extend(vec!["-preset".to_string(), "p4".to_string()]);
+            }
+            HwEncoder::QuickSync => {
+                params.extend(vec!["-preset".to_string(), "faster".to_string()]);
+            }
+            HwEncoder::None => {
+                params.extend(vec![
+                    "-preset".to_string(),
+                    "fast".to_string(),
+                    "-crf".to_string(),
+                    "23".to_string(),
+                ]);
+            }
+            _ => {}
+        }
+
+        params
     }
 
     pub async fn process_benchmark_data(
@@ -295,7 +286,13 @@ impl FfmpegProcessor {
             input_path.to_str().unwrap().to_string(),
         ];
 
+        // Add hardware acceleration parameters first
         args.extend(self.get_hw_encoding_params());
+
+        // Add default encoding parameters
+        args.extend(self.get_default_encoding_params());
+
+        // Add any additional user parameters that might override defaults
         args.extend(params.iter().cloned());
         args.push(output_path.to_str().unwrap().to_string());
 
@@ -411,8 +408,11 @@ impl FfmpegProcessor {
                 raw_path.to_str().unwrap().to_string(),
             ];
 
-            // Add hardware encoding if available
+            // Add hardware encoding parameters first
             encode_args.extend(self.get_hw_encoding_params());
+
+            // Add default encoding parameters
+            encode_args.extend(self.get_default_encoding_params());
 
             // Add container-specific options
             match ext {
@@ -451,7 +451,13 @@ impl FfmpegProcessor {
                 input_path.to_str().unwrap().to_string(),
             ];
 
+            // Add hardware acceleration parameters first
             args.extend(self.get_hw_encoding_params());
+
+            // Add default encoding parameters
+            args.extend(self.get_default_encoding_params());
+
+            // Add any additional user parameters that might override defaults
             args.extend(params.iter().cloned());
 
             if ext == "mp4" {

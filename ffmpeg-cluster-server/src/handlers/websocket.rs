@@ -47,7 +47,7 @@ async fn handle_socket(
     }
 
     // Check for active job
-    let (job_id, required_clients, current_clients) = {
+    let (job_id, _required_clients, _current_clients) = {
         let state = state_arc.lock().await;
         (
             state.current_job.clone(),
@@ -503,39 +503,7 @@ async fn handle_segment_failed(
 
     Ok(())
 }
-async fn handle_broadcast_message(
-    broadcast_msg: ServerMessage,
-    client_id: &str,
-    sender: &mut SplitSink<WebSocket, Message>,
-    state_arc: &Arc<Mutex<AppState>>,
-) -> Result<(), anyhow::Error> {
-    let state = state_arc.lock().await;
 
-    match &broadcast_msg {
-        ServerMessage::BenchmarkRequest { .. } => {
-            // Skip if client already completed benchmark for current job
-            if state
-                .clients
-                .get(client_id)
-                .map_or(false, |&perf| perf > 0.0)
-            {
-                info!(
-                    "Skipping duplicate benchmark request for client {}",
-                    client_id
-                );
-                return Ok(());
-            }
-        }
-        _ => {}
-    }
-
-    // Process the message normally
-    if let Ok(msg_str) = serde_json::to_string(&broadcast_msg) {
-        sender.send(Message::Text(msg_str.into())).await?;
-    }
-
-    Ok(())
-}
 async fn handle_all_segments_complete(
     state: &mut AppState,
     job_id: &str,
