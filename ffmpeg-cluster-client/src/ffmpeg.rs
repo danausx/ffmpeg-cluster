@@ -189,6 +189,7 @@ impl FfmpegProcessor {
             }
             HwAccel::None => HwEncoder::None,
         };
+        info!("Detected Encoder: {:?}", encoder);
 
         let capabilities = EncoderCapabilities {
             has_nvenc,
@@ -325,6 +326,8 @@ impl FfmpegProcessor {
         Ok(fps)
     }
 
+    // In ffmpeg-cluster-client/src/ffmpeg.rs, update process_segment_data:
+
     pub async fn process_segment_data(
         &self,
         data: &[u8],
@@ -336,182 +339,116 @@ impl FfmpegProcessor {
         let temp_dir = self.work_dir.join(format!("segment_{}", Uuid::new_v4()));
         tokio::fs::create_dir_all(&temp_dir).await?;
 
-        let ext = match format.split(',').next() {
-            Some(f) => f.trim(),
-            None => "mp4",
-        };
+        let input_path = temp_dir.join(format!("input.{}", format));
+        let output_path = temp_dir.join(format!("output.{}", format));
 
-        let input_path = temp_dir.join(format!("input.{}", ext));
-        let output_path = temp_dir.join(format!("output.{}", ext));
-
+        info!(
+            "Writing segment data ({} bytes) to {}",
+            data.len(),
+            input_path.display()
+        );
         tokio::fs::write(&input_path, data).await?;
 
-        // Detect codec first
-        let codec_output = Command::new(Self::get_ffprobe_path())
-            .args([
-                "-v",
-                "error",
-                "-select_streams",
-                "v:0",
-                "-show_entries",
-                "stream=codec_name",
-                "-of",
-                "default=noprint_wrappers=1:nokey=1",
-                input_path.to_str().unwrap(),
-            ])
-            .output()
-            .await?;
+        // Build FFmpeg command with hardware encoding parameters
+        let mut cmd_args = vec!["-y".to_string()];
 
-        let codec = String::from_utf8_lossy(&codec_output.stdout)
-            .trim()
-            .to_string();
-        info!("Detected codec: {}", codec);
+        // Add hardware acceleration parameters first
+        cmd_args.extend(self.get_hw_encoding_params());
 
-        // For HEVC content, we need to:
-        // 1. First extract raw HEVC with proper NAL units
-        // 2. Then re-encode to the desired format
-        if codec == "hevc" || codec == "h265" {
-            let raw_path = temp_dir.join("intermediate.h265");
+        // Add input file
+        cmd_args.extend(["-i".to_string(), input_path.to_str().unwrap().to_string()]);
 
-            // First pass: Extract raw HEVC with proper NAL units
-            let extract_args = vec![
-                "-y",
-                "-i",
-                input_path.to_str().unwrap(),
-                "-c:v",
-                "copy",
-                "-bsf:v",
-                "hevc_mp4toannexb", // Important: Adds proper NAL unit delimiters
-                "-f",
-                "hevc",
-                raw_path.to_str().unwrap(),
-            ];
-
-            info!("Extracting HEVC with args: {:?}", extract_args);
-            let extract_output = Command::new(Self::get_ffmpeg_path())
-                .args(&extract_args)
-                .output()
-                .await?;
-
-            if !extract_output.status.success() {
-                let stderr = String::from_utf8_lossy(&extract_output.stderr);
-                error!("HEVC extraction failed: {}", stderr);
-                anyhow::bail!("HEVC extraction failed: {}", stderr);
-            }
-
-            // Second pass: Process the raw HEVC stream
-            let mut encode_args = vec![
-                "-y".to_string(),
-                "-i".to_string(),
-                raw_path.to_str().unwrap().to_string(),
-            ];
-
-            // Add hardware encoding parameters first
-            encode_args.extend(self.get_hw_encoding_params());
-
-            // Add default encoding parameters
-            encode_args.extend(self.get_default_encoding_params());
-
-            // Add container-specific options
-            match ext {
-                "mp4" => {
-                    encode_args.extend([
-                        "-movflags".to_string(),
-                        "+faststart+frag_keyframe+empty_moov".to_string(),
-                    ]);
-                }
-                "mkv" => {
-                    encode_args.extend(["-cluster_size_limit".to_string(), "2M".to_string()]);
-                }
-                _ => {}
-            }
-
-            // Add any additional parameters and output path
-            encode_args.extend(params.iter().cloned());
-            encode_args.push(output_path.to_str().unwrap().to_string());
-
-            info!("Encoding HEVC with args: {:?}", encode_args);
-            let output = Command::new(Self::get_ffmpeg_path())
-                .args(&encode_args)
-                .output()
-                .await?;
-
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                error!("FFmpeg encoding failed: {}", stderr);
-                anyhow::bail!("FFmpeg encoding failed: {}", stderr);
-            }
-        } else {
-            // For non-HEVC content, use standard processing
-            let mut args = vec![
-                "-y".to_string(),
-                "-i".to_string(),
-                input_path.to_str().unwrap().to_string(),
-            ];
-
-            // Add hardware acceleration parameters first
-            args.extend(self.get_hw_encoding_params());
-
-            // Add default encoding parameters
-            args.extend(self.get_default_encoding_params());
-
-            // Add any additional user parameters that might override defaults
-            args.extend(params.iter().cloned());
-
-            if ext == "mp4" {
-                args.extend([
-                    "-movflags".to_string(),
-                    "+faststart+frag_keyframe+empty_moov".to_string(),
+        // Add encoding parameters
+        match self.hw_encoder {
+            HwEncoder::Videotoolbox => {
+                cmd_args.extend([
+                    "-c:v".to_string(),
+                    "h264_videotoolbox".to_string(),
+                    "-b:v".to_string(),
+                    "2M".to_string(),
+                    "-tag:v".to_string(),
+                    "avc1".to_string(),
                 ]);
             }
-
-            args.push("-f".to_string());
-            args.push(match ext {
-                "mp4" => "mp4".to_string(),
-                "mkv" => "matroska".to_string(),
-                "avi" => "avi".to_string(),
-                _ => "mp4".to_string(),
-            });
-            args.push(output_path.to_str().unwrap().to_string());
-
-            info!("Processing with args: {:?}", args);
-            let output = Command::new(Self::get_ffmpeg_path())
-                .args(&args)
-                .output()
-                .await?;
-
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                error!("FFmpeg processing failed: {}", stderr);
-                anyhow::bail!("FFmpeg processing failed: {}", stderr);
+            HwEncoder::Nvenc => {
+                cmd_args.extend([
+                    "-c:v".to_string(),
+                    "h264_nvenc".to_string(),
+                    "-preset".to_string(),
+                    "p4".to_string(),
+                    "-rc".to_string(),
+                    "constqp".to_string(),
+                    "-qp".to_string(),
+                    "23".to_string(),
+                ]);
+            }
+            _ => {
+                // Default to libx264 for software encoding
+                cmd_args.extend([
+                    "-c:v".to_string(),
+                    "libx264".to_string(),
+                    "-preset".to_string(),
+                    "medium".to_string(),
+                    "-crf".to_string(),
+                    "23".to_string(),
+                ]);
             }
         }
 
-        let processed_data = match tokio::fs::read(&output_path).await {
-            Ok(data) => data,
-            Err(e) => {
-                error!("Failed to read output file: {}", e);
-                let _ = tokio::fs::remove_dir_all(&temp_dir).await;
-                anyhow::bail!("Failed to read output file: {}", e);
-            }
-        };
+        // Add any additional parameters from the server
+        cmd_args.extend(params.iter().cloned());
+
+        // Add output format options
+        if format == "mp4" {
+            cmd_args.extend([
+                "-movflags".to_string(),
+                "+faststart+frag_keyframe+empty_moov".to_string(),
+            ]);
+        }
+
+        // Add output path
+        cmd_args.push(output_path.to_str().unwrap().to_string());
+
+        info!("Processing segment with FFmpeg args: {:?}", cmd_args);
+
+        // Execute FFmpeg command
+        let output = Command::new(Self::get_ffmpeg_path())
+            .args(&cmd_args)
+            .output()
+            .await
+            .context("Failed to execute FFmpeg command")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            error!("FFmpeg stderr: {}", stderr);
+            error!("FFmpeg stdout: {}", stdout);
+            anyhow::bail!("FFmpeg processing failed with status: {}", output.status);
+        }
+
+        let processed_data = tokio::fs::read(&output_path)
+            .await
+            .context("Failed to read processed segment")?;
 
         let elapsed = start_time.elapsed().as_secs_f64();
         let frame_count = Self::get_frame_count(&output_path).await?;
         let fps = frame_count as f64 / elapsed;
 
         info!(
-            "Processed segment {} ({} frames) at {:.2} FPS",
-            segment_id, frame_count, fps
+            "Successfully processed segment {} ({} frames) at {:.2} FPS, output size: {} bytes",
+            segment_id,
+            frame_count,
+            fps,
+            processed_data.len()
         );
 
+        // Clean up temporary files
         if let Err(e) = tokio::fs::remove_dir_all(&temp_dir).await {
-            error!("Failed to cleanup segment directory: {}", e);
+            warn!("Failed to clean up temporary directory: {}", e);
         }
 
         Ok((processed_data, fps))
     }
-
     async fn get_frame_count(file_path: &PathBuf) -> Result<u64> {
         let output = Command::new(Self::get_ffprobe_path())
             .args([

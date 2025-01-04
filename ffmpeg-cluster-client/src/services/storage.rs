@@ -6,7 +6,6 @@ use tracing::info;
 
 pub struct StorageManager {
     pool: sqlx::SqlitePool,
-    client_id: String,
 }
 
 impl StorageManager {
@@ -44,9 +43,7 @@ impl StorageManager {
         // Initialize database schema
         sqlx::query(
             r#"
-            CREATE TABLE IF NOT EXISTS client (
-                id TEXT PRIMARY KEY,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            CREATE TABLE IF NOT EXISTS client_info (
                 last_seen DATETIME DEFAULT CURRENT_TIMESTAMP
             )
             "#,
@@ -55,44 +52,17 @@ impl StorageManager {
         .await
         .context("Failed to create client table")?;
 
-        // Generate or get existing client ID
-        let client_id = Self::get_or_create_client_id(&pool).await?;
-
-        Ok(Self { pool, client_id })
-    }
-
-    async fn get_or_create_client_id(pool: &sqlx::SqlitePool) -> Result<String> {
-        // Try to get existing client ID
-        let result = sqlx::query_scalar::<_, String>("SELECT id FROM client LIMIT 1")
-            .fetch_optional(pool)
-            .await
-            .context("Failed to query client ID")?;
-
-        match result {
-            Some(id) => Ok(id),
-            None => {
-                // Create new client ID
-                let new_id = uuid::Uuid::new_v4().to_string();
-                sqlx::query("INSERT INTO client (id) VALUES (?)")
-                    .bind(&new_id)
-                    .execute(pool)
-                    .await
-                    .context("Failed to insert new client ID")?;
-                Ok(new_id)
-            }
-        }
-    }
-
-    pub fn get_id(&self) -> &str {
-        &self.client_id
+        Ok(Self { pool })
     }
 
     pub async fn update_last_seen(&self) -> Result<()> {
-        sqlx::query("UPDATE client SET last_seen = CURRENT_TIMESTAMP WHERE id = ?")
-            .bind(&self.client_id)
-            .execute(&self.pool)
-            .await
-            .context("Failed to update last seen timestamp")?;
+        sqlx::query(
+            "INSERT INTO client_info (last_seen) VALUES (CURRENT_TIMESTAMP)
+             ON CONFLICT (rowid) DO UPDATE SET last_seen = CURRENT_TIMESTAMP",
+        )
+        .execute(&self.pool)
+        .await
+        .context("Failed to update last seen timestamp")?;
         Ok(())
     }
 }

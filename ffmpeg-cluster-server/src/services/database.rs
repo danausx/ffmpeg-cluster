@@ -81,4 +81,14 @@ impl DatabaseManager {
             .await?;
         Ok(result.is_some())
     }
+    pub async fn create_job(&self, job_id: &str, file_name: &str) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO jobs (id, file_name, status, created_at) VALUES (?, ?, 'pending', CURRENT_TIMESTAMP)"
+        )
+        .bind(job_id)
+        .bind(file_name)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
 }

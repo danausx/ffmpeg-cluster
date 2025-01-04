@@ -106,7 +106,9 @@ pub enum ClientStatus {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub enum ClientMessage {
-    RequestId,
+    RequestId {
+        participate: bool,
+    },
     Capabilities {
         encoders: EncoderCapabilities,
     },

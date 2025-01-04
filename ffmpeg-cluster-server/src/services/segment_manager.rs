@@ -8,7 +8,6 @@ use std::path::{Path, PathBuf};
 use tokio::process::Command;
 use tracing::{error, info, warn};
 use uuid::Uuid;
-use which;
 
 #[derive(Debug)]
 pub struct SegmentData {
@@ -193,31 +192,32 @@ impl SegmentManager {
     }
 
     pub fn add_pending_segment(&mut self, segment_id: String) {
+        info!("Adding pending segment: {}", segment_id);
         self.pending_segments.insert(segment_id);
-        self.total_segments = self.pending_segments.len();
+        self.total_segments = self.pending_segments.len().max(self.total_segments);
+        info!("Total segments now: {}", self.total_segments);
     }
 
     pub fn get_completion_percentage(&self) -> f32 {
-        if self.total_segments == 0 {
+        let percentage = if self.total_segments == 0 {
             0.0
         } else {
             (self.completed_segments.len() as f32 / self.total_segments as f32) * 100.0
-        }
+        };
+        info!(
+            "Completion: {:.1}% ({}/{})",
+            percentage,
+            self.completed_segments.len(),
+            self.total_segments
+        );
+        percentage
     }
 
     pub fn is_job_complete(&self) -> bool {
         if self.pending_segments.is_empty() {
-            return false;
+            return true;
         }
-
-        let result = self.completed_segments.len() == self.total_segments;
-        info!(
-            "Checking job completion: {}/{} segments complete = {}",
-            self.completed_segments.len(),
-            self.total_segments,
-            result
-        );
-        result
+        self.completed_segments.len() == self.total_segments
     }
     pub async fn init(&self) -> Result<()> {
         info!("Initializing segment manager for job {}", self.job_id);

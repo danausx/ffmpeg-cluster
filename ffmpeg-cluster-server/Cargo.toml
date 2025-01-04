@@ -31,3 +31,5 @@ sqlx = { version = "0.8.2", features = ["runtime-tokio", "sqlite", "uuid"] }
 uuid = { version = "1.6", features = ["v4", "serde"] }
 directories = "5.0"
 which = "7.0.1"
+
+crc32fast = "1.3"

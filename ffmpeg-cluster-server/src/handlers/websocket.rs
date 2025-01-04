@@ -5,11 +5,16 @@ use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{ws::WebSocketUpgrade, State};
 use axum::response::Response;
 use bytes::Bytes;
-use ffmpeg_cluster_common::models::messages::{ClientMessage, ServerMessage};
+use ffmpeg_cluster_common::file_transfer::FileTransferMessage;
+use ffmpeg_cluster_common::models::messages::{
+    ClientInfo, ClientMessage, ClientStatus, ServerMessage,
+};
+use ffmpeg_cluster_common::transfer_handler::FileTransfer;
 use futures::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
+use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, Mutex};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
@@ -32,163 +37,214 @@ async fn handle_socket(
     socket: WebSocket,
     state_arc: Arc<Mutex<AppState>>,
 ) -> Result<(), anyhow::Error> {
-    let client_id = Uuid::new_v4().to_string();
     let (mut sender, mut receiver) = socket.split();
+    let (tx_ws, mut rx_ws) = mpsc::channel(32);
+    let mut file_transfer = FileTransfer::new(PathBuf::from("work/server/uploads"));
+    let mut client_id = String::new();
+    let client_id_arc = Arc::new(Mutex::new(String::new()));
 
-    // Add client to state
-    {
-        let mut state = state_arc.lock().await;
-        state.clients.insert(client_id.clone(), 0.0);
-        info!("New client connected: {}", client_id);
-        // Register client in database
-        if let Err(e) = state.db.register_client(&client_id).await {
-            error!("Failed to register client in database: {}", e);
-        }
-    }
-
-    // Check for active job
-    let (job_id, _required_clients, _current_clients) = {
-        let state = state_arc.lock().await;
-        (
-            state.current_job.clone(),
-            state.config.required_clients,
-            state.clients.len(),
-        )
+    // Create sender task first
+    let sender_task = {
+        let mut sender = sender;
+        tokio::spawn(async move {
+            info!("Starting WebSocket sender task");
+            while let Some(msg) = rx_ws.recv().await {
+                info!("Sender task: Sending message: {:?}", msg);
+                if let Err(e) = sender.send(msg).await {
+                    error!("Failed to send message through websocket: {}", e);
+                    break;
+                }
+                info!("Sender task: Message sent successfully");
+            }
+            info!("WebSocket sender task ending");
+        })
     };
 
-    // Send initial client ID message
-    if let Some(job_id) = &job_id {
-        let msg = ServerMessage::ClientId {
-            id: client_id.clone(),
-            job_id: job_id.clone(),
-        };
-        let msg_str = serde_json::to_string(&msg)?;
-        sender.send(Message::Text(msg_str.into())).await?;
-    } else {
-        let msg = ServerMessage::ClientIdle {
-            id: client_id.clone(),
-        };
-        let msg_str = serde_json::to_string(&msg)?;
-        sender.send(Message::Text(msg_str.into())).await?;
-    }
-
+    // Get broadcast receiver
     let mut broadcast_rx = {
         let state = state_arc.lock().await;
+        info!("Created broadcast receiver for new client");
         state.broadcast_tx.subscribe()
     };
 
-    loop {
-        tokio::select! {
-                    msg = receiver.next() => {
-                        match msg {
-                            Some(Ok(Message::Text(text))) => {
-                        if let Ok(client_msg) = serde_json::from_str::<ClientMessage>(&text) {
-            match client_msg {
-                ClientMessage::BenchmarkResult { fps } => {
-                    if let Err(e) = handle_benchmark_result(&state_arc, &client_id, fps).await {
-                        error!("Error handling benchmark result: {}", e);
-                        if let Ok(mut state) = state_arc.try_lock() {
-                            handle_segment_failed(&mut state, &client_id, e.to_string()).await;
-                        }
-                    }
-                }
-                ClientMessage::SegmentComplete { segment_id, fps, data, format } => {
-                    if let Err(e) = handle_segment_complete(&state_arc, &client_id, segment_id, fps, data, format).await {
-                        error!("Error handling segment completion: {}", e);
-                        if let Ok(mut state) = state_arc.try_lock() {
-                            handle_segment_failed(&mut state, &client_id, e.to_string()).await;
-                        }
-                    }
-                }
-                ClientMessage::SegmentFailed { error } => {
-                    if let Ok(mut state) = state_arc.try_lock() {
-                        handle_segment_failed(&mut state, &client_id, error).await;
-                    }
-                }
-                ClientMessage::UploadAndProcessFile { file_name, data, config, participate } => {
-                    info!("Received file upload request from client {}: {} ({} bytes)",
-                        client_id, file_name, data.len());
+    // Spawn broadcast handler task
+    let broadcast_task = {
+        let tx_ws = tx_ws.clone();
+        let client_id_clone = client_id_arc.clone();
 
-                    let response = handle_upload_and_process(
-                        file_name,
-                        data,
-                        config,
-                        &state_arc,
-                    ).await;
+        tokio::spawn(async move {
+            info!("Starting broadcast handler task");
+            while let Ok(msg) = broadcast_rx.recv().await {
+                let current_client_id = client_id_clone.lock().await.clone();
 
-                    if let Ok(response_str) = serde_json::to_string(&response) {
-                        if let Err(e) = sender.send(Message::Text(response_str.into())).await {
-                            error!("Failed to send upload response: {}", e);
+                info!(
+                    "Broadcast handler: Received message for target: {:?}, current client: {}",
+                    msg.target, current_client_id
+                );
+
+                // For broadcast messages (target: None) or messages targeted to this client
+                if msg.target.is_none() || msg.target.as_ref() == Some(&current_client_id) {
+                    if let Err(e) = tx_ws.send(Message::Text(msg.content.into())).await {
+                        error!("Failed to send broadcast message: {}", e);
+                        break;
+                    }
+                    info!("Broadcast handler: Message forwarded successfully");
+                }
+            }
+            info!("Broadcast handler task ending");
+        })
+    };
+
+    // Main message loop
+    while let Some(msg) = receiver.next().await {
+        match msg? {
+            Message::Text(text) => {
+                if let Ok(transfer_msg) = serde_json::from_str::<FileTransferMessage>(&text) {
+                    match file_transfer.handle_chunk(transfer_msg).await {
+                        Ok(Some(final_path)) => {
+                            let file_name = final_path
+                                .file_name()
+                                .unwrap()
+                                .to_string_lossy()
+                                .to_string();
+                            let data = tokio::fs::read(&final_path).await?;
+
+                            let response =
+                                handle_upload_and_process(file_name, data, None, &state_arc).await;
+
+                            if let Ok(response_str) = serde_json::to_string(&response) {
+                                tx_ws.send(Message::Text(response_str.into())).await?;
+                            }
+
+                            if let Err(e) = tokio::fs::remove_file(&final_path).await {
+                                error!("Failed to clean up temporary file: {}", e);
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            error!("File transfer error: {}", e);
+                            let error_msg = ServerMessage::Error {
+                                code: "UPLOAD_FAILED".to_string(),
+                                message: e.to_string(),
+                            };
+                            if let Ok(msg_str) = serde_json::to_string(&error_msg) {
+                                tx_ws.send(Message::Text(msg_str.into())).await?;
+                            }
+                        }
+                    }
+                } else if let Ok(client_msg) = serde_json::from_str::<ClientMessage>(&text) {
+                    match client_msg {
+                        ClientMessage::RequestId { participate } => {
+                            client_id = Uuid::new_v4().to_string();
+                            let response = ServerMessage::ClientId {
+                                id: client_id.clone(),
+                                job_id: String::new(),
+                            };
+
+                            // Update client ID in broadcast handler
+                            if let Ok(mut shared_id) = client_id_arc.try_lock() {
+                                *shared_id = client_id.clone();
+                            } else {
+                                error!("Failed to update client ID in broadcast handler");
+                            }
+
+                            // Send response to client
+                            if let Ok(response_str) = serde_json::to_string(&response) {
+                                tx_ws.send(Message::Text(response_str.into())).await?;
+                            }
+
+                            if participate {
+                                let mut state = state_arc.lock().await;
+                                state.clients.insert(
+                                    client_id.clone(),
+                                    ClientInfo {
+                                        client_id: client_id.clone(),
+                                        connected_at: std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap()
+                                            .as_secs(),
+                                        current_job: None,
+                                        performance: Some(0.0),
+                                        status: ClientStatus::Connected,
+                                    },
+                                );
+                                info!("New processing client connected: {}", client_id);
+                            } else {
+                                info!("New command connection established: {}", client_id);
+                            }
+                        }
+                        ClientMessage::BenchmarkResult { fps } => {
+                            if let Err(e) =
+                                handle_benchmark_result(&state_arc, &client_id, fps).await
+                            {
+                                error!("Error handling benchmark result: {}", e);
+                            }
+                        }
+                        ClientMessage::SegmentComplete {
+                            segment_id,
+                            fps,
+                            data,
+                            format,
+                        } => {
+                            if let Err(e) = handle_segment_complete(
+                                &state_arc, &client_id, segment_id, fps, data, format,
+                            )
+                            .await
+                            {
+                                error!("Error handling segment completion: {}", e);
+                            }
+                        }
+                        ClientMessage::SegmentFailed { error } => {
+                            if let Ok(mut state) = state_arc.try_lock() {
+                                if let Err(e) =
+                                    handle_segment_failed(&mut state, &client_id, error).await
+                                {
+                                    error!("Error handling segment failure: {}", e);
+                                }
+                            }
+                        }
+                        ClientMessage::Capabilities { encoders } => {
+                            info!(
+                                "Received capabilities from client {}: {:?}",
+                                client_id, encoders
+                            );
+                        }
+                        _ => {
+                            warn!("Unhandled client message type: {:?}", client_msg);
                         }
                     }
                 }
-                _ => {}
+            }
+            Message::Binary(data) => {
+                if let Ok(transfer_msg) = serde_json::from_slice::<FileTransferMessage>(&data) {
+                    if let Err(e) = file_transfer.handle_chunk(transfer_msg).await {
+                        error!("Failed to handle binary chunk: {}", e);
+                        let error_msg = ServerMessage::Error {
+                            code: "TRANSFER_FAILED".to_string(),
+                            message: e.to_string(),
+                        };
+                        if let Ok(msg_str) = serde_json::to_string(&error_msg) {
+                            tx_ws.send(Message::Text(msg_str.into())).await?;
+                        }
+                    }
+                } else {
+                    warn!("Received invalid binary message format");
+                }
+            }
+            Message::Ping(data) => {
+                tx_ws.send(Message::Pong(data)).await?;
+            }
+            Message::Pong(_) => {}
+            Message::Close(_) => {
+                break;
             }
         }
-                            }
-                            Some(Ok(Message::Binary(_))) => {
-                                warn!("Unexpected binary message from client");
-                            }
-                            Some(Ok(Message::Ping(data))) => {
-                                if let Err(e) = sender.send(Message::Pong(data)).await {
-                                    error!("Failed to send pong: {}", e);
-                                    break;
-                                }
-                            }
-                            Some(Ok(Message::Pong(_))) => {}
-                            Some(Ok(Message::Close(_))) => {
-                                info!("Client {} requested close", client_id);
-                                break;
-                            }
-                            Some(Err(e)) => {
-                                error!("WebSocket error for client {}: {}", client_id, e);
-                                break;
-                            }
-                            None => break,
-                        }
-                    }
-                    Ok(broadcast_msg) = broadcast_rx.recv() => {
-                        match serde_json::from_str::<ServerMessage>(&broadcast_msg.content) {
-                            Ok(server_msg) => {
-                                if broadcast_msg.target.is_none() || broadcast_msg.target.as_ref() == Some(&client_id) {
-                                    match server_msg {
-                                        ServerMessage::ClientId { id: _, job_id } => {
-                                            let msg = ServerMessage::ClientId {
-                                                id: client_id.clone(),
-                                                job_id: job_id.clone(),
-                                            };
-                                            if let Ok(msg_str) = serde_json::to_string(&msg) {
-                                                if let Err(e) = sender.send(Message::Text(msg_str.into())).await {
-                                                    error!("Failed to send job assignment to client: {}", e);
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                        ServerMessage::JobComplete { .. } => {
-                                            // Forward job completion message to client
-                                            if let Err(e) = sender.send(Message::Text(broadcast_msg.content.into())).await {
-                                                error!("Failed to forward job completion message: {}", e);
-                                                break;
-                                            }
-                                        }
-                                        _ => {
-                                            if let Err(e) = sender.send(Message::Text(broadcast_msg.content.into())).await {
-                                                error!("Failed to forward message to client: {}", e);
-                                                break;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                error!("Failed to parse broadcast message: {}", e);
-                            }
-                        }
-                    }
-                }
     }
 
-    // Cleanup on disconnect
+    // Cleanup
+    broadcast_task.abort();
+    sender_task.abort();
+
     info!("Client {} disconnected", client_id);
     let mut state = state_arc.lock().await;
     if !state.segment_manager.has_segment(&client_id) {
@@ -209,47 +265,65 @@ async fn handle_benchmark_result(
     fps: f64,
 ) -> Result<(), anyhow::Error> {
     info!(
-        "Received benchmark result from client {}: {} FPS",
+        "Processing benchmark result from client {} - {:.2} FPS",
         client_id, fps
     );
 
-    let should_start_processing = {
+    let should_distribute = {
         let mut state = state_arc.lock().await;
-        if let Some(client_perf) = state.clients.get_mut(client_id) {
-            *client_perf = fps;
+
+        // Update client performance
+        if let Some(client) = state.clients.get_mut(client_id) {
+            client.performance = Some(fps);
         }
 
-        let all_benchmarked = state.clients.values().all(|&perf| perf > 0.0);
+        // Mark client as benchmarked
+        state.benchmarked_clients.insert(client_id.to_string());
+
         let client_count = state.clients.len();
         let required_count = state.config.required_clients;
+        let all_benchmarked = state.benchmarked_clients.len() == client_count;
+
+        info!(
+            "Benchmark status update:\n\
+             - Benchmarked clients: {}/{}\n\
+             - Required clients: {}\n\
+             - All benchmarked: {}\n\
+             - Current job: {:?}",
+            state.benchmarked_clients.len(),
+            client_count,
+            required_count,
+            all_benchmarked,
+            state.current_job
+        );
 
         if all_benchmarked && client_count >= required_count {
-            if let Some(job_id) = state.current_job.as_ref() {
-                Some((
+            state.current_job.as_ref().map(|job_id| {
+                info!(
+                    "All benchmarks complete - preparing to distribute segments for job {}",
+                    job_id
+                );
+                (
                     job_id.clone(),
                     state.clients.keys().cloned().collect::<Vec<_>>(),
-                ))
-            } else {
-                None
-            }
+                )
+            })
         } else {
             None
         }
     };
-    if let Some((job_id, client_ids)) = should_start_processing {
-        if let Err(e) = distribute_segments(state_arc, &job_id, &client_ids).await {
-            error!("Failed to distribute segments: {}", e);
-            // Handle distribution failure
-            if let Ok(mut state) = state_arc.try_lock() {
-                handle_segment_failed(
-                    &mut state,
-                    client_id,
-                    format!("Failed to distribute segments: {}", e),
-                )
-                .await;
-            }
-            return Err(anyhow::Error::from(e));
-        }
+
+    // Start segment distribution if conditions are met
+    if let Some((job_id, client_ids)) = should_distribute {
+        info!(
+            "Starting segment distribution for job {}:\n\
+             - Total clients: {}\n\
+             - Client IDs: {:?}",
+            job_id,
+            client_ids.len(),
+            client_ids
+        );
+        distribute_segments(state_arc, &job_id, &client_ids).await?;
     }
 
     Ok(())
@@ -260,32 +334,45 @@ async fn distribute_segments(
     job_id: &str,
     client_ids: &[String],
 ) -> Result<(), anyhow::Error> {
-    let (input_file, _fps, total_frames) = {
+    info!(
+        "Starting segment distribution for job {} to {} clients",
+        job_id,
+        client_ids.len()
+    );
+
+    let (input_file, fps, total_frames) = {
         let state = state_arc.lock().await;
         if let Some(input) = state.current_input.as_ref() {
-            match crate::services::ffmpeg::FfmpegService::get_video_info(
-                input, true, // Set exactly=true for frame-accurate counting
-            )
-            .await
-            {
-                Ok((fps, _, frames)) => (input.clone(), fps, frames),
+            match crate::services::ffmpeg::FfmpegService::get_video_info(input, true).await {
+                Ok((fps, _, frames)) => {
+                    info!("Video info: {} FPS, {} total frames", fps, frames);
+                    (input.clone(), fps, frames)
+                }
                 Err(e) => {
                     error!("Failed to get video info: {}", e);
                     return Err(anyhow::anyhow!("Failed to get video info: {}", e));
                 }
             }
         } else {
+            error!("No input file available for job {}", job_id);
             return Err(anyhow::anyhow!("No input file available"));
         }
     };
 
-    // Ensure frame-accurate distribution
     let frames_per_client = total_frames / client_ids.len() as u64;
     let mut remaining_frames = total_frames % client_ids.len() as u64;
 
+    info!(
+        "Frame distribution plan:\n\
+         - Total frames: {}\n\
+         - Frames per client: {}\n\
+         - Remaining frames: {}\n\
+         - Input file: {}",
+        total_frames, frames_per_client, remaining_frames, input_file
+    );
+
     let mut current_frame = 0;
-    for (_i, client_id) in client_ids.iter().enumerate() {
-        // Calculate frames for this segment
+    for (i, client_id) in client_ids.iter().enumerate() {
         let mut segment_frames = frames_per_client;
         if remaining_frames > 0 {
             segment_frames += 1;
@@ -297,24 +384,45 @@ async fn distribute_segments(
         current_frame = end_frame;
 
         info!(
-            "Distributing frames {} to {} to client {}",
-            start_frame, end_frame, client_id
+            "Creating segment for client {} ({}/{}):\n\
+             - Start frame: {}\n\
+             - End frame: {}\n\
+             - Total frames: {}",
+            client_id,
+            i + 1,
+            client_ids.len(),
+            start_frame,
+            end_frame,
+            segment_frames
         );
 
         let segment_data = {
             let mut state = state_arc.lock().await;
-            let data = state
+            match state
                 .segment_manager
                 .create_segment(&input_file, start_frame, end_frame)
-                .await?;
-
-            // Register the pending segment
-            state
-                .segment_manager
-                .add_pending_segment(data.segment_id.clone());
-            data
+                .await
+            {
+                Ok(data) => {
+                    info!(
+                        "Successfully created segment:\n\
+                         - Segment ID: {}\n\
+                         - Size: {} bytes\n\
+                         - Format: {}",
+                        data.segment_id,
+                        data.data.len(),
+                        data.format
+                    );
+                    data
+                }
+                Err(e) => {
+                    error!("Failed to create segment for client {}: {}", client_id, e);
+                    return Err(e);
+                }
+            }
         };
 
+        // Create and send the process message
         let process_msg = ServerMessage::ProcessSegment {
             data: segment_data.data,
             format: segment_data.format,
@@ -338,16 +446,36 @@ async fn distribute_segments(
             };
 
             let state = state_arc.lock().await;
-            if let Err(e) = state.broadcast_tx.send(broadcast_msg) {
-                error!("Failed to send segment to client {}: {}", client_id, e);
-            } else {
-                info!(
-                    "Sent segment {} to client {}",
-                    segment_data.segment_id, client_id
-                );
+            match state.broadcast_tx.send(broadcast_msg) {
+                Ok(_) => {
+                    info!(
+                        "Successfully sent segment {} to client {}",
+                        segment_data.segment_id, client_id
+                    );
+                }
+                Err(e) => {
+                    error!(
+                        "Failed to send segment {} to client {}: {}",
+                        segment_data.segment_id, client_id, e
+                    );
+                    return Err(anyhow::anyhow!(
+                        "Failed to send segment to client {}: {}",
+                        client_id,
+                        e
+                    ));
+                }
             }
         }
     }
+
+    info!(
+        "Completed segment distribution for job {}:\n\
+         - Total frames distributed: {}\n\
+         - Number of clients: {}",
+        job_id,
+        total_frames,
+        client_ids.len()
+    );
 
     Ok(())
 }
@@ -414,7 +542,7 @@ async fn handle_segment_complete(
             .add_processed_segment(client_id.to_string(), segment_data);
 
         if let Some(perf) = state.clients.get_mut(client_id) {
-            *perf = fps;
+            perf.performance = Some(fps);
         }
 
         let job_id = state.current_job.clone();
@@ -531,7 +659,10 @@ async fn handle_all_segments_complete(
             state.job_queue.mark_job_completed(job_id);
 
             // Reset client performance metrics and clear segments
-            state.clients.iter_mut().for_each(|(_, perf)| *perf = 0.0);
+            state
+                .clients
+                .iter_mut()
+                .for_each(|(_, client)| client.performance = Some(0.0));
             state.segment_manager.reset_state();
 
             // Send job completion notification with download URL to all clients
@@ -597,15 +728,24 @@ async fn handle_all_segments_complete(
                             job_id: next_job_id,
                         };
 
-                        if let Ok(msg_str) = serde_json::to_string(&benchmark_msg) {
-                            let broadcast_msg = crate::ServerMessage {
-                                target: None,
-                                content: msg_str,
-                            };
-                            if let Err(e) = state.broadcast_tx.send(broadcast_msg) {
-                                error!("Failed to broadcast benchmark request for next job: {}", e);
+                        match serde_json::to_string(&benchmark_msg) {
+                            Ok(msg_str) => {
+                                info!("Serialized benchmark message: {}", msg_str);
+                                let broadcast_msg = crate::ServerMessage {
+                                    target: None,
+                                    content: msg_str,
+                                };
+                                match state.broadcast_tx.send(broadcast_msg) {
+                                    Ok(_) => {
+                                        info!("Successfully broadcast benchmark request to clients")
+                                    }
+                                    Err(e) => {
+                                        error!("Failed to broadcast benchmark request: {}", e)
+                                    }
+                                }
                             }
-                        }
+                            Err(e) => error!("Failed to serialize benchmark message: {}", e),
+                        };
                     }
                 }
             } else {

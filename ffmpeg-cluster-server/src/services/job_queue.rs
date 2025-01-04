@@ -82,16 +82,26 @@ impl JobQueue {
             self.queue.len()
         );
 
+        info!("Queue state after adding job:");
+        info!("  Queue size: {}", self.queue.len());
+        info!("  Active job: {:?}", self.active_job);
+        info!("  Jobs in queue: {:?}", self.queue);
+
         job_id
     }
 
     pub fn get_next_job(&mut self) -> Option<&Job> {
-        // Only return the next job if there's no active job
-        if self.active_job.is_none() && !self.queue.is_empty() {
+        if !self.queue.is_empty() {
             let job_id = &self.queue[0];
             self.active_job = Some(job_id.clone());
+            info!(
+                "Getting next job: {}. Queue size: {}",
+                job_id,
+                self.queue.len()
+            );
             self.jobs.get(job_id)
         } else {
+            info!("No jobs in queue");
             None
         }
     }

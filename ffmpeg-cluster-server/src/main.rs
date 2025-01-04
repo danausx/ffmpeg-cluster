@@ -1,7 +1,11 @@
 use axum::{extract::DefaultBodyLimit, routing::get, Router};
 use clap::Parser;
-use ffmpeg_cluster_common::models::config::ServerConfig;
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use ffmpeg_cluster_common::models::{config::ServerConfig, messages::ClientInfo};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+    sync::Arc,
+};
 use tokio::sync::{broadcast, Mutex};
 use tower_http::{cors::CorsLayer, services::ServeDir};
 use tracing::{error, info, Level};
@@ -53,14 +57,15 @@ pub struct ServerMessage {
 
 pub struct AppState {
     pub config: ServerConfig,
-    pub clients: HashMap<String, f64>, // client_id -> performance (fps)
+    pub clients: HashMap<String, ClientInfo>,
     pub segment_manager: SegmentManager,
     pub job_queue: JobQueue,
     pub broadcast_tx: broadcast::Sender<ServerMessage>,
     pub current_job: Option<String>,
     pub current_input: Option<String>,
-    pub client_segments: HashMap<String, String>, // Add this line - maps client_id to segment_id
+    pub client_segments: HashMap<String, String>,
     pub db: DatabaseManager,
+    pub benchmarked_clients: HashSet<String>,
 }
 
 #[tokio::main]
@@ -135,7 +140,7 @@ async fn main() {
             retry_delay: args.retry_delay,
             read_timeout: 60,
             write_timeout: 60,
-            max_message_size: 1000 * 1024 * 1024, // 1000MB
+            max_message_size: 1000 * 1024 * 1024,
             key: String::new(),
         },
         clients: HashMap::new(),
@@ -144,8 +149,9 @@ async fn main() {
         broadcast_tx: tx,
         current_job: None,
         current_input: None,
-        client_segments: HashMap::new(), // Add this line
+        client_segments: HashMap::new(),
         db,
+        benchmarked_clients: HashSet::new(),
     }));
 
     // Initialize segment manager
