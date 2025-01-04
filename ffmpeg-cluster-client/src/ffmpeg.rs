@@ -1,8 +1,19 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use uuid::Uuid;
+
+#[derive(Debug, Clone, clap::ValueEnum)]
+pub enum HwAccel {
+    Auto,
+    None,
+    Nvenc,
+    Qsv,
+    Vaapi,
+    Videotoolbox,
+    Amf,
+}
 
 #[derive(Debug, Clone)]
 pub enum HwEncoder {
@@ -74,8 +85,8 @@ impl FfmpegProcessor {
         Self::get_binary_path().join(Self::get_ffprobe_name())
     }
 
-    pub async fn new(client_id: &str) -> Self {
-        let hw_encoder = Self::detect_hw_encoder().await;
+    pub async fn new(client_id: &str, preferred_hw: HwAccel) -> Self {
+        let hw_encoder = Self::detect_hw_encoder(preferred_hw).await;
         let work_dir = PathBuf::from("work").join("client").join(client_id);
 
         if !work_dir.exists() {
@@ -93,7 +104,13 @@ impl FfmpegProcessor {
         }
     }
 
-    async fn detect_hw_encoder() -> HwEncoder {
+    async fn detect_hw_encoder(preferred_hw: HwAccel) -> HwEncoder {
+        // If user explicitly chose "none", return immediately
+        if matches!(preferred_hw, HwAccel::None) {
+            info!("Software encoding selected explicitly");
+            return HwEncoder::None;
+        }
+
         let output = match Command::new(Self::get_ffmpeg_path())
             .args(&["-encoders"])
             .output()
@@ -106,24 +123,77 @@ impl FfmpegProcessor {
             }
         };
 
-        let encoder = if cfg!(target_os = "macos") && output.contains("h264_videotoolbox") {
-            info!("Using VideoToolbox (macOS) hardware encoder");
-            HwEncoder::Videotoolbox
-        } else if output.contains("h264_nvenc") {
-            info!("Using NVIDIA NVENC hardware encoder");
-            HwEncoder::Nvenc
-        } else if output.contains("h264_vaapi") && cfg!(target_os = "linux") {
-            info!("Using VAAPI hardware encoder");
-            HwEncoder::Vaapi
-        } else if output.contains("h264_qsv") {
-            info!("Using Intel QuickSync hardware encoder");
-            HwEncoder::QuickSync
-        } else if output.contains("h264_amf") {
-            info!("Using AMD AMF hardware encoder");
-            HwEncoder::Amf
-        } else {
-            info!("No hardware encoder found, using software encoding");
-            HwEncoder::None
+        // Function to check encoder availability and log result
+        let check_encoder = |name: &str, desc: &str| {
+            let available = output.contains(name);
+            if available {
+                info!("Found {} encoder ({})", desc, name);
+            } else {
+                info!("{} encoder not available ({})", desc, name);
+            }
+            available
+        };
+
+        // Match based on preferred hardware
+        let encoder = match preferred_hw {
+            HwAccel::Auto => {
+                info!("Auto-detecting hardware encoder...");
+                if cfg!(target_os = "macos") && check_encoder("h264_videotoolbox", "VideoToolbox") {
+                    HwEncoder::Videotoolbox
+                } else if check_encoder("h264_nvenc", "NVIDIA NVENC") {
+                    HwEncoder::Nvenc
+                } else if check_encoder("h264_vaapi", "VAAPI") && cfg!(target_os = "linux") {
+                    HwEncoder::Vaapi
+                } else if check_encoder("h264_qsv", "Intel QuickSync") {
+                    HwEncoder::QuickSync
+                } else if check_encoder("h264_amf", "AMD AMF") {
+                    HwEncoder::Amf
+                } else {
+                    info!("No hardware encoder found, falling back to software encoding");
+                    HwEncoder::None
+                }
+            }
+            HwAccel::Nvenc => {
+                if check_encoder("h264_nvenc", "NVIDIA NVENC") {
+                    HwEncoder::Nvenc
+                } else {
+                    warn!("NVENC not available, falling back to software encoding");
+                    HwEncoder::None
+                }
+            }
+            HwAccel::Qsv => {
+                if check_encoder("h264_qsv", "Intel QuickSync") {
+                    HwEncoder::QuickSync
+                } else {
+                    warn!("QuickSync not available, falling back to software encoding");
+                    HwEncoder::None
+                }
+            }
+            HwAccel::Vaapi => {
+                if check_encoder("h264_vaapi", "VAAPI") && cfg!(target_os = "linux") {
+                    HwEncoder::Vaapi
+                } else {
+                    warn!("VAAPI not available, falling back to software encoding");
+                    HwEncoder::None
+                }
+            }
+            HwAccel::Videotoolbox => {
+                if cfg!(target_os = "macos") && check_encoder("h264_videotoolbox", "VideoToolbox") {
+                    HwEncoder::Videotoolbox
+                } else {
+                    warn!("VideoToolbox not available, falling back to software encoding");
+                    HwEncoder::None
+                }
+            }
+            HwAccel::Amf => {
+                if check_encoder("h264_amf", "AMD AMF") {
+                    HwEncoder::Amf
+                } else {
+                    warn!("AMD AMF not available, falling back to software encoding");
+                    HwEncoder::None
+                }
+            }
+            HwAccel::None => HwEncoder::None,
         };
 
         info!("Selected encoder: {:?}", encoder);

@@ -12,7 +12,7 @@ use tokio_tungstenite::{
 use tracing::{error, info, warn};
 mod ffmpeg;
 mod services;
-use ffmpeg::FfmpegProcessor;
+use ffmpeg::{FfmpegProcessor, HwAccel};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -132,7 +132,7 @@ async fn handle_connection(
                             state.client_id = Some(id.clone());
 
                             if state.processor.is_none() {
-                                let proc = FfmpegProcessor::new(&id).await;
+                                let proc = FfmpegProcessor::new(&id, HwAccel::Auto).await;
                                 state.processor = Some(proc);
                             }
                         }
@@ -148,7 +148,7 @@ async fn handle_connection(
                         if state.client_id.is_none() {
                             state.client_id = Some(id.clone());
                             if state.processor.is_none() {
-                                let proc = FfmpegProcessor::new(&id).await;
+                                let proc = FfmpegProcessor::new(&id, HwAccel::Auto).await;
                                 state.processor = Some(proc);
                             }
                         }
